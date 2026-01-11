@@ -1,9 +1,13 @@
 """Checkpoint Manager - Main orchestrator for checkpoint operations."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from pathlib import Path
 import time
 import logging
+import threading
+import queue
+import copy
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -13,6 +17,92 @@ from flextrain.config import CheckpointConfig
 from .storage import StorageBackend, create_storage_backend
 
 logger = logging.getLogger(__name__)
+
+
+class AsyncCheckpointWriter:
+    """Handles asynchronous checkpoint writing in a background thread."""
+
+    def __init__(self, storage: StorageBackend, num_workers: int = 1):
+        self.storage = storage
+        self._queue: queue.Queue = queue.Queue()
+        self._workers: List[threading.Thread] = []
+        self._pending_count = 0
+        self._lock = threading.Lock()
+        self._shutdown = False
+
+        # Start worker threads
+        for i in range(num_workers):
+            worker = threading.Thread(target=self._worker_loop, daemon=True)
+            worker.start()
+            self._workers.append(worker)
+
+        logger.debug(f"AsyncCheckpointWriter started with {num_workers} workers")
+
+    def _worker_loop(self):
+        """Background worker that processes save requests."""
+        while not self._shutdown:
+            try:
+                task = self._queue.get(timeout=1.0)
+                if task is None:  # Shutdown signal
+                    break
+
+                state, path, callback = task
+                try:
+                    self.storage.save(state, path)
+                    if callback:
+                        callback(path, True, None)
+                except Exception as e:
+                    logger.error(f"Async checkpoint save failed: {e}")
+                    if callback:
+                        callback(path, False, e)
+                finally:
+                    with self._lock:
+                        self._pending_count -= 1
+                    self._queue.task_done()
+
+            except queue.Empty:
+                continue
+
+    def submit(self, state: Dict[str, Any], path: str, callback=None) -> None:
+        """Submit a checkpoint for async saving."""
+        # Deep copy state to CPU to avoid GPU memory issues
+        cpu_state = self._copy_to_cpu(state)
+
+        with self._lock:
+            self._pending_count += 1
+
+        self._queue.put((cpu_state, path, callback))
+
+    def _copy_to_cpu(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy state dict to CPU memory."""
+        cpu_state = {}
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                cpu_state[key] = value.cpu().clone()
+            elif isinstance(value, dict):
+                cpu_state[key] = self._copy_to_cpu(value)
+            else:
+                cpu_state[key] = copy.deepcopy(value)
+        return cpu_state
+
+    def wait(self) -> None:
+        """Wait for all pending saves to complete."""
+        self._queue.join()
+
+    def pending_count(self) -> int:
+        """Get number of pending saves."""
+        with self._lock:
+            return self._pending_count
+
+    def shutdown(self) -> None:
+        """Shutdown the writer."""
+        self._shutdown = True
+        # Send shutdown signals
+        for _ in self._workers:
+            self._queue.put(None)
+        # Wait for workers
+        for worker in self._workers:
+            worker.join(timeout=5.0)
 
 
 class CheckpointManager:
@@ -29,12 +119,20 @@ class CheckpointManager:
             bucket_name=config.bucket_name,
         )
 
-        self._checkpoints = []
+        # Async writer for non-blocking saves
+        self._async_writer: Optional[AsyncCheckpointWriter] = None
+        if config.async_save:
+            self._async_writer = AsyncCheckpointWriter(
+                self.storage,
+                num_workers=config.num_io_workers
+            )
+
+        self._checkpoints: List[Dict[str, Any]] = []
         self._save_count = 0
         self._last_save_time = time.time()
 
         Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        logger.info(f"CheckpointManager initialized (backend={config.storage_backend})")
+        logger.info(f"CheckpointManager initialized (backend={config.storage_backend}, async={config.async_save})")
 
     def save(
         self,
@@ -45,9 +143,24 @@ class CheckpointManager:
         epoch: int = 0,
         metrics: Optional[Dict[str, float]] = None,
         is_fsdp: bool = False,
-        blocking: bool = True,
+        blocking: bool = False,
     ) -> Optional[str]:
-        """Save checkpoint."""
+        """
+        Save checkpoint.
+
+        Args:
+            model: Model to save
+            optimizer: Optimizer state to save
+            lr_scheduler: LR scheduler state to save
+            step: Current training step
+            epoch: Current epoch
+            metrics: Training metrics
+            is_fsdp: Whether model is FSDP wrapped
+            blocking: Force synchronous save even if async is enabled
+
+        Returns:
+            Path to saved checkpoint
+        """
         if not self.is_main_process and not is_fsdp:
             return None
 
@@ -79,12 +192,28 @@ class CheckpointManager:
             "config": self.config.to_dict() if hasattr(self.config, 'to_dict') else {},
         }
 
-        self.storage.save(state, ckpt_path)
+        # Save checkpoint
+        if self._async_writer and not blocking:
+            # Async save - returns immediately after copying to CPU
+            def on_complete(path, success, error):
+                if success:
+                    logger.debug(f"Async checkpoint completed: {path}")
+                else:
+                    logger.error(f"Async checkpoint failed: {error}")
+
+            self._async_writer.submit(state, ckpt_path, on_complete)
+            save_time = time.time() - start_time
+            logger.info(f"Checkpoint queued (async): {ckpt_path} (step={step}, queue_time={save_time*1000:.1f}ms)")
+        else:
+            # Synchronous save
+            self.storage.save(state, ckpt_path)
+            save_time = time.time() - start_time
+            logger.info(f"Checkpoint saved: {ckpt_path} (step={step}, time={save_time*1000:.1f}ms)")
+
         self._checkpoints.append({"path": ckpt_path, "step": step, "metrics": metrics})
         self._prune_checkpoints()
-
-        save_time = time.time() - start_time
-        logger.info(f"Checkpoint saved: {ckpt_path} (step={step}, time={save_time*1000:.1f}ms)")
+        self._save_count += 1
+        self._last_save_time = time.time()
 
         return ckpt_path
 
@@ -172,5 +301,21 @@ class CheckpointManager:
                 logger.warning(f"Failed to delete checkpoint: {e}")
 
     def wait_for_pending(self) -> None:
-        """Wait for any pending async saves."""
-        pass
+        """Wait for any pending async saves to complete."""
+        if self._async_writer:
+            pending = self._async_writer.pending_count()
+            if pending > 0:
+                logger.info(f"Waiting for {pending} pending checkpoint(s)...")
+                self._async_writer.wait()
+                logger.info("All pending checkpoints completed")
+
+    def pending_saves(self) -> int:
+        """Get number of pending async saves."""
+        if self._async_writer:
+            return self._async_writer.pending_count()
+        return 0
+
+    def __del__(self):
+        """Cleanup on destruction."""
+        if self._async_writer:
+            self._async_writer.shutdown()
