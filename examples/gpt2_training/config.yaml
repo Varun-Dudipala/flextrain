@@ -1,0 +1,37 @@
+main:
+  experiment_name: gpt2_training
+  output_dir: ./outputs
+  seed: 42
+
+training:
+  model_name: gpt2-small
+  batch_size: 8
+  micro_batch_size: 4
+  gradient_accumulation_steps: 2
+  learning_rate: 3e-4
+  weight_decay: 0.01
+  max_steps: 10000
+  warmup_steps: 500
+  max_seq_length: 512
+  log_interval: 10
+  save_interval: 500
+
+distributed:
+  strategy: fsdp
+  mixed_precision: true
+  mixed_precision_dtype: bf16
+  activation_checkpointing: true
+
+checkpoint:
+  checkpoint_dir: ./checkpoints
+  async_save: true
+  keep_last_n: 3
+  keep_best_n: 2
+  best_metric: loss
+  best_mode: min
+
+elastic:
+  min_nodes: 1
+  max_nodes: 4
+  allow_elastic_scaling: false
+  max_restarts: 3
