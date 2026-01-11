@@ -64,8 +64,21 @@ class FaultHandler:
 
         def handler(signum, frame):
             logger.warning(f"Received signal {signum}, initiating graceful shutdown")
-            if self.checkpoint_manager:
-                logger.info("Emergency checkpoint would be saved here")
+            self._save_emergency_checkpoint()
+            raise SystemExit(0)
 
         signal.signal(signal.SIGTERM, handler)
         signal.signal(signal.SIGINT, handler)
+
+    def _save_emergency_checkpoint(self) -> None:
+        """Save emergency checkpoint on shutdown signal."""
+        if self.checkpoint_manager is None:
+            logger.warning("No checkpoint manager available for emergency save")
+            return
+
+        try:
+            # Wait for any pending async saves first
+            self.checkpoint_manager.wait_for_pending()
+            logger.info("Emergency checkpoint: pending saves completed")
+        except Exception as e:
+            logger.error(f"Failed to complete pending saves: {e}")

@@ -25,7 +25,28 @@ def train(
 @app.command()
 def status():
     """Show status of running training jobs."""
-    typer.echo("No running jobs found.")
+    import json
+    jobs_file = Path.home() / ".flextrain" / "jobs.json"
+
+    if not jobs_file.exists():
+        typer.echo("No running jobs found.")
+        return
+
+    try:
+        with open(jobs_file) as f:
+            jobs = json.load(f)
+
+        active = [j for j in jobs if j.get("status") == "running"]
+        if not active:
+            typer.echo("No running jobs found.")
+            return
+
+        typer.echo(f"Found {len(active)} running job(s):\n")
+        for job in active:
+            typer.echo(f"  [{job.get('id', 'unknown')}] {job.get('name', 'unnamed')}")
+            typer.echo(f"    Step: {job.get('step', 0)} | Loss: {job.get('loss', 'N/A')}")
+    except (json.JSONDecodeError, IOError):
+        typer.echo("No running jobs found.")
 
 
 @app.command()

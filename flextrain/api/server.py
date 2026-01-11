@@ -1,9 +1,34 @@
 """FastAPI server for FlexTrain dashboard."""
 
+import os
+import json
+from pathlib import Path
+from typing import Dict, List
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 app = FastAPI(title="FlexTrain Dashboard", version="0.1.0")
+
+# Simple file-based job tracking
+JOBS_FILE = Path.home() / ".flextrain" / "jobs.json"
+
+
+def _load_jobs() -> List[Dict]:
+    """Load jobs from file."""
+    if not JOBS_FILE.exists():
+        return []
+    try:
+        with open(JOBS_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def _save_jobs(jobs: List[Dict]) -> None:
+    """Save jobs to file."""
+    JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(JOBS_FILE, "w") as f:
+        json.dump(jobs, f)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -49,4 +74,7 @@ async def health():
 @app.get("/api/jobs")
 async def list_jobs():
     """List training jobs."""
-    return {"jobs": []}
+    jobs = _load_jobs()
+    # Filter out completed jobs older than 24h
+    active_jobs = [j for j in jobs if j.get("status") != "completed"]
+    return {"jobs": active_jobs, "total": len(jobs)}
