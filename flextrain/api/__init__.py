@@ -1,1 +1,5 @@
-"""API module."""
+"""REST API and dashboard."""
+
+from .server import create_app
+
+__all__ = ["create_app"]

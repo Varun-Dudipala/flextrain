@@ -1,138 +1,133 @@
-"""Checkpoint Manager - Main orchestrator for checkpoint operations."""
+"""Checkpoint manager: naming, saving (sync or async), retention, and resume.
 
-from typing import Any, Dict, Optional, List
-from pathlib import Path
-import time
+Invariants:
+
+* Files are named ``checkpoint_step{step:08d}.pt``; "latest" means highest step,
+  never newest mtime (clock skew, copies and re-saves make mtime unreliable).
+* Retention is computed from the storage listing, so it keeps working across job
+  restarts, and it runs only after a write is durable - an in-flight or failed save
+  can never cause an older good checkpoint to be deleted.
+* Resume walks checkpoints newest -> oldest and skips unreadable ones, so a corrupted
+  latest checkpoint costs a few steps of progress instead of the whole job.
+"""
+
+from __future__ import annotations
+
 import logging
-import threading
-import queue
-import copy
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from flextrain.config import CheckpointConfig
-from .storage import StorageBackend, create_storage_backend
+
+from .async_writer import AsyncCheckpointWriter, CheckpointSaveError, SaveRecord, _save_with_retries
+from .state import capture_state, restore_state, validate_checkpoint
+from .storage import LocalStorage, StorageBackend, create_storage_backend
 
 logger = logging.getLogger(__name__)
 
+CHECKPOINT_PATTERN = re.compile(r"^checkpoint_step(\d+)\.pt$")
+_STALE_TMP_PATTERN = re.compile(r"^\.checkpoint_step\d+\.pt\.[0-9a-f]+\.tmp$")
 
-class AsyncCheckpointWriter:
-    """Handles asynchronous checkpoint writing in a background thread."""
 
-    def __init__(self, storage: StorageBackend, num_workers: int = 1):
-        self.storage = storage
-        self._queue: queue.Queue = queue.Queue()
-        self._workers: List[threading.Thread] = []
-        self._pending_count = 0
-        self._lock = threading.Lock()
-        self._shutdown = False
-
-        # Start worker threads
-        for i in range(num_workers):
-            worker = threading.Thread(target=self._worker_loop, daemon=True)
-            worker.start()
-            self._workers.append(worker)
-
-        logger.debug(f"AsyncCheckpointWriter started with {num_workers} workers")
-
-    def _worker_loop(self):
-        """Background worker that processes save requests."""
-        while not self._shutdown:
-            try:
-                task = self._queue.get(timeout=1.0)
-                if task is None:  # Shutdown signal
-                    break
-
-                state, path, callback = task
-                try:
-                    self.storage.save(state, path)
-                    if callback:
-                        callback(path, True, None)
-                except Exception as e:
-                    logger.error(f"Async checkpoint save failed: {e}")
-                    if callback:
-                        callback(path, False, e)
-                finally:
-                    with self._lock:
-                        self._pending_count -= 1
-                    self._queue.task_done()
-
-            except queue.Empty:
-                continue
-
-    def submit(self, state: Dict[str, Any], path: str, callback=None) -> None:
-        """Submit a checkpoint for async saving."""
-        # Deep copy state to CPU to avoid GPU memory issues
-        cpu_state = self._copy_to_cpu(state)
-
-        with self._lock:
-            self._pending_count += 1
-
-        self._queue.put((cpu_state, path, callback))
-
-    def _copy_to_cpu(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Copy state dict to CPU memory."""
-        cpu_state = {}
-        for key, value in state.items():
-            if isinstance(value, torch.Tensor):
-                cpu_state[key] = value.cpu().clone()
-            elif isinstance(value, dict):
-                cpu_state[key] = self._copy_to_cpu(value)
-            else:
-                cpu_state[key] = copy.deepcopy(value)
-        return cpu_state
-
-    def wait(self) -> None:
-        """Wait for all pending saves to complete."""
-        self._queue.join()
-
-    def pending_count(self) -> int:
-        """Get number of pending saves."""
-        with self._lock:
-            return self._pending_count
-
-    def shutdown(self) -> None:
-        """Shutdown the writer."""
-        self._shutdown = True
-        # Send shutdown signals
-        for _ in self._workers:
-            self._queue.put(None)
-        # Wait for workers
-        for worker in self._workers:
-            worker.join(timeout=5.0)
+@dataclass(frozen=True)
+class CheckpointInfo:
+    path: str
+    step: int
 
 
 class CheckpointManager:
-    """Manages checkpoint saving, loading, versioning, and pruning."""
+    """Saves, prunes and restores checkpoints. Only rank 0 touches storage on save."""
 
-    def __init__(self, config: CheckpointConfig, rank: int = 0, world_size: int = 1):
+    def __init__(
+        self,
+        config: CheckpointConfig,
+        rank: int = 0,
+        world_size: int = 1,
+        checkpoint_dir: Optional[str] = None,
+        storage: Optional[StorageBackend] = None,
+        pin_memory: bool = False,
+        write_retries: int = 2,
+    ):
         self.config = config
         self.rank = rank
         self.world_size = world_size
         self.is_main_process = rank == 0
+        self.checkpoint_dir = checkpoint_dir or config.checkpoint_dir or "./checkpoints"
+        self.storage = storage or create_storage_backend(config.storage_backend, bucket_name=config.bucket_name)
+        self.write_retries = write_retries
 
-        self.storage = create_storage_backend(
-            backend_type=config.storage_backend,
-            bucket_name=config.bucket_name,
-        )
-
-        # Async writer for non-blocking saves
-        self._async_writer: Optional[AsyncCheckpointWriter] = None
-        if config.async_save:
-            self._async_writer = AsyncCheckpointWriter(
+        self._writer: Optional[AsyncCheckpointWriter] = None
+        if config.async_save and self.is_main_process:
+            self._writer = AsyncCheckpointWriter(
                 self.storage,
-                num_workers=config.num_io_workers
+                max_pending=config.max_pending_saves,
+                pin_memory=pin_memory,
+                write_retries=write_retries,
             )
+        self.last_blocking_seconds: Optional[float] = None
+        self.last_saved_step: Optional[int] = None
+        self._sync_history: List[SaveRecord] = []
 
-        self._checkpoints: List[Dict[str, Any]] = []
-        self._save_count = 0
-        self._last_save_time = time.time()
+        if self.is_main_process and isinstance(self.storage, LocalStorage):
+            Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+            self._remove_stale_temp_files()
+        logger.debug("CheckpointManager(dir=%s, backend=%s, async=%s)",
+                     self.checkpoint_dir, config.storage_backend, config.async_save)
 
-        Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        logger.info(f"CheckpointManager initialized (backend={config.storage_backend}, async={config.async_save})")
+    # ------------------------------------------------------------------ naming / listing
+    def path_for_step(self, step: int) -> str:
+        return self.storage.join(self.checkpoint_dir, f"checkpoint_step{step:08d}.pt")
+
+    def list_checkpoints(self) -> List[CheckpointInfo]:
+        """All checkpoints in ``checkpoint_dir``, oldest step first."""
+        infos = []
+        for path in self.storage.list(self.checkpoint_dir):
+            match = CHECKPOINT_PATTERN.match(Path(path).name)
+            if match:
+                infos.append(CheckpointInfo(path=path, step=int(match.group(1))))
+        return sorted(infos, key=lambda info: info.step)
+
+    def latest_checkpoint(self) -> Optional[str]:
+        checkpoints = self.list_checkpoints()
+        return checkpoints[-1].path if checkpoints else None
+
+    # ------------------------------------------------------------------ saving
+    def save_state(self, state: Dict[str, Any], step: int, blocking: bool = False) -> Optional[str]:
+        """Persist an already-captured state dict. Non-main ranks return ``None``.
+
+        With ``async_save`` the call blocks only for the host snapshot; ``blocking=True``
+        additionally waits until this (and every earlier) save is durable.
+        """
+        if not self.is_main_process:
+            self.last_saved_step = step  # keep in sync on all ranks: callers branch on it collectively
+            return None
+        state = dict(state)
+        state["step"] = step
+        path = self.path_for_step(step)
+        start = time.perf_counter()
+
+        if self._writer is not None:
+            self._writer.submit(state, path, on_success=self._on_saved)
+            if blocking:
+                self._writer.wait()
+            self.last_blocking_seconds = time.perf_counter() - start
+            logger.info("Checkpoint step %d %s (blocked %.1f ms)", step,
+                        "saved" if blocking else "queued", self.last_blocking_seconds * 1e3)
+        else:
+            nbytes = _save_with_retries(self.storage, state, path, self.write_retries)
+            self.last_blocking_seconds = time.perf_counter() - start
+            self._sync_history.append(SaveRecord(path, nbytes, 0.0, self.last_blocking_seconds))
+            logger.info("Checkpoint saved: %s (%.1f MB, blocked %.1f ms)",
+                        path, nbytes / 1e6, self.last_blocking_seconds * 1e3)
+            self._on_saved(path)
+        self.last_saved_step = step
+        return path
 
     def save(
         self,
@@ -142,80 +137,57 @@ class CheckpointManager:
         step: int = 0,
         epoch: int = 0,
         metrics: Optional[Dict[str, float]] = None,
-        is_fsdp: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
         blocking: bool = False,
     ) -> Optional[str]:
+        """Capture and save model/optimizer/scheduler state.
+
+        Must be called on **every** rank (gathering FSDP state is a collective).
         """
-        Save checkpoint.
+        if not self.config.save_optimizer:
+            optimizer = None
+        state = capture_state(model, optimizer, lr_scheduler)
+        state.update(epoch=epoch, metrics=dict(metrics or {}), world_size=self.world_size)
+        if extra:
+            state.update(extra)
+        return self.save_state(state, step=step, blocking=blocking)
 
-        Args:
-            model: Model to save
-            optimizer: Optimizer state to save
-            lr_scheduler: LR scheduler state to save
-            step: Current training step
-            epoch: Current epoch
-            metrics: Training metrics
-            is_fsdp: Whether model is FSDP wrapped
-            blocking: Force synchronous save even if async is enabled
+    def _on_saved(self, path: str) -> None:
+        self._prune()
 
-        Returns:
-            Path to saved checkpoint
-        """
-        if not self.is_main_process and not is_fsdp:
-            return None
+    def _prune(self) -> None:
+        checkpoints = self.list_checkpoints()
+        for info in checkpoints[: max(0, len(checkpoints) - self.config.keep_last_n)]:
+            try:
+                self.storage.delete(info.path)
+                logger.debug("Pruned checkpoint %s", info.path)
+            except Exception as e:
+                logger.warning("Failed to delete old checkpoint %s: %s", info.path, e)
 
-        metrics = metrics or {}
-        start_time = time.time()
+    def _remove_stale_temp_files(self) -> None:
+        """Delete temp files left behind by a writer that died mid-save."""
+        for path in Path(self.checkpoint_dir).glob(".checkpoint_step*.tmp"):
+            if _STALE_TMP_PATTERN.match(path.name):
+                path.unlink(missing_ok=True)
+                logger.info("Removed partial checkpoint %s", path)
 
-        # Generate path
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"checkpoint_step{step:08d}_{timestamp}.pt"
-        ckpt_path = str(Path(self.config.checkpoint_dir) / filename)
+    # ------------------------------------------------------------------ loading
+    def load_state(self, path: str) -> Dict[str, Any]:
+        """Load and validate a single checkpoint (raises if unusable)."""
+        state = self.storage.load(path)
+        problems = validate_checkpoint(state)
+        if problems:
+            raise ValueError(f"invalid checkpoint {path}: {'; '.join(problems)}")
+        return state
 
-        # Get model state
-        if isinstance(model, FSDP):
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
-                model_state = model.state_dict()
-        else:
-            model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-
-        state = {
-            "model": model_state,
-            "optimizer": optimizer.state_dict() if optimizer else None,
-            "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler else None,
-            "step": step,
-            "epoch": epoch,
-            "metrics": metrics,
-            "config": self.config.to_dict() if hasattr(self.config, 'to_dict') else {},
-        }
-
-        # Save checkpoint
-        if self._async_writer and not blocking:
-            # Async save - returns immediately after copying to CPU
-            def on_complete(path, success, error):
-                if success:
-                    logger.debug(f"Async checkpoint completed: {path}")
-                else:
-                    logger.error(f"Async checkpoint failed: {error}")
-
-            self._async_writer.submit(state, ckpt_path, on_complete)
-            save_time = time.time() - start_time
-            logger.info(f"Checkpoint queued (async): {ckpt_path} (step={step}, queue_time={save_time*1000:.1f}ms)")
-        else:
-            # Synchronous save
-            self.storage.save(state, ckpt_path)
-            save_time = time.time() - start_time
-            logger.info(f"Checkpoint saved: {ckpt_path} (step={step}, time={save_time*1000:.1f}ms)")
-
-        self._checkpoints.append({"path": ckpt_path, "step": step, "metrics": metrics})
-        self._prune_checkpoints()
-        self._save_count += 1
-        self._last_save_time = time.time()
-
-        return ckpt_path
+    def load_latest_state(self) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Newest checkpoint that loads and validates, skipping corrupted ones."""
+        for info in reversed(self.list_checkpoints()):
+            try:
+                return info.path, self.load_state(info.path)
+            except Exception as e:
+                logger.warning("Skipping unusable checkpoint %s: %s", info.path, e)
+        return None
 
     def load(
         self,
@@ -223,99 +195,60 @@ class CheckpointManager:
         optimizer: Optional[torch.optim.Optimizer] = None,
         lr_scheduler: Optional[Any] = None,
         checkpoint_path: Optional[str] = None,
+        strict: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Load checkpoint."""
-        if checkpoint_path is None:
-            checkpoint_path = self._get_latest()
-
-        if checkpoint_path is None:
-            raise ValueError("No checkpoint found to load")
-
-        logger.info(f"Loading checkpoint: {checkpoint_path}")
-        state = self.storage.load(checkpoint_path)
-
-        # Load model
-        if isinstance(model, FSDP):
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
-                model.load_state_dict(state["model"])
+        """Restore state in place. ``checkpoint_path=None`` means newest valid checkpoint."""
+        if checkpoint_path is not None:
+            path, state = checkpoint_path, self.load_state(checkpoint_path)
         else:
-            target = model.module if hasattr(model, 'module') else model
-            target.load_state_dict(state["model"])
-
-        # Load optimizer
-        if optimizer and state.get("optimizer"):
-            optimizer.load_state_dict(state["optimizer"])
-
-        # Load scheduler
-        if lr_scheduler and state.get("lr_scheduler"):
-            lr_scheduler.load_state_dict(state["lr_scheduler"])
-
-        return {
-            "step": state.get("step", 0),
-            "epoch": state.get("epoch", 0),
-            "metrics": state.get("metrics", {}),
-        }
+            found = self.load_latest_state()
+            if found is None:
+                raise FileNotFoundError(f"No usable checkpoint found in {self.checkpoint_dir}")
+            path, state = found
+        restore_state(state, model, optimizer, lr_scheduler,
+                      strict=self.config.strict_resume if strict is None else strict)
+        logger.info("Restored checkpoint %s (step %d)", path, state["step"])
+        return {"path": path, "step": state["step"], "epoch": state.get("epoch", 0),
+                "metrics": state.get("metrics", {})}
 
     def try_load_latest(
         self,
-        model: Optional[nn.Module] = None,
+        model: nn.Module,
         optimizer: Optional[torch.optim.Optimizer] = None,
         lr_scheduler: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Try to load latest checkpoint if exists."""
-        latest = self._get_latest()
-        if latest is None:
-            return None
-        if model is not None:
-            return self.load(model, optimizer, lr_scheduler, latest)
-        return {"checkpoint_path": latest}
-
-    def _get_latest(self) -> Optional[str]:
-        """Get path to most recent checkpoint."""
-        ckpt_dir = Path(self.config.checkpoint_dir)
-        if not ckpt_dir.exists():
+        """Like ``load`` but returns ``None`` when there is nothing to resume from."""
+        try:
+            return self.load(model, optimizer, lr_scheduler)
+        except FileNotFoundError:
             return None
 
-        checkpoints = list(ckpt_dir.glob("checkpoint_*.pt"))
-        if not checkpoints:
-            return None
-
-        return str(max(checkpoints, key=lambda p: p.stat().st_mtime))
-
-    def _prune_checkpoints(self) -> None:
-        """Remove old checkpoints beyond retention limit."""
-        if len(self._checkpoints) <= self.config.keep_last_n:
-            return
-
-        sorted_ckpts = sorted(self._checkpoints, key=lambda x: x["step"], reverse=True)
-        to_keep = sorted_ckpts[:self.config.keep_last_n]
-        to_delete = sorted_ckpts[self.config.keep_last_n:]
-
-        for ckpt in to_delete:
-            try:
-                self.storage.delete(ckpt["path"])
-                self._checkpoints.remove(ckpt)
-            except Exception as e:
-                logger.warning(f"Failed to delete checkpoint: {e}")
-
+    # ------------------------------------------------------------------ lifecycle
     def wait_for_pending(self) -> None:
-        """Wait for any pending async saves to complete."""
-        if self._async_writer:
-            pending = self._async_writer.pending_count()
-            if pending > 0:
-                logger.info(f"Waiting for {pending} pending checkpoint(s)...")
-                self._async_writer.wait()
-                logger.info("All pending checkpoints completed")
+        """Block until queued async saves are durable; re-raises a failed save."""
+        if self._writer is not None:
+            pending = self._writer.pending_count()
+            if pending:
+                logger.info("Waiting for %d pending checkpoint write(s)...", pending)
+            self._writer.wait()
 
     def pending_saves(self) -> int:
-        """Get number of pending async saves."""
-        if self._async_writer:
-            return self._async_writer.pending_count()
-        return 0
+        return self._writer.pending_count() if self._writer is not None else 0
 
-    def __del__(self):
-        """Cleanup on destruction."""
-        if self._async_writer:
-            self._async_writer.shutdown()
+    @property
+    def history(self) -> List[SaveRecord]:
+        return list(self._writer.history) if self._writer is not None else list(self._sync_history)
+
+    def close(self, raise_errors: bool = True) -> None:
+        """Drain pending writes and release host buffers."""
+        if self._writer is not None:
+            self._writer.close(raise_errors=raise_errors)
+
+    def __enter__(self) -> CheckpointManager:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close(raise_errors=exc_type is None)
+
+
+__all__ = ["CheckpointManager", "CheckpointInfo", "CheckpointSaveError", "CHECKPOINT_PATTERN"]
