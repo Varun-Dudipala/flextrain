@@ -1,5 +1,6 @@
-"""Elastic scaling module."""
+"""Elastic scaling: torchrun launcher integration and resize-aware resume."""
 
-from .manager import ElasticManager
+from .launcher import build_torchrun_command, launch
+from .manager import ElasticEnv, ElasticManager, TopologyChange
 
-__all__ = ["ElasticManager"]
+__all__ = ["ElasticEnv", "ElasticManager", "TopologyChange", "build_torchrun_command", "launch"]

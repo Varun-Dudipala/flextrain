@@ -1,60 +1,81 @@
-"""Metrics logging and experiment tracking."""
+"""Append-only JSONL metrics logging."""
 
-import logging
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Optional
+from __future__ import annotations
+
 import json
+import logging
+import math
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
 
+def _jsonable(value: Any) -> Any:
+    """Convert tensors / numpy scalars to Python and non-finite floats to null (valid JSON)."""
+    if hasattr(value, "item") and callable(value.item):
+        try:
+            value = value.item()
+        except (ValueError, RuntimeError):
+            return str(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 class MetricsLogger:
-    """Simple metrics logger with SQLite backend."""
+    """Writes one JSON object per line to ``<run_dir>/metrics.jsonl``.
 
-    def __init__(
-        self,
-        experiment_name: str = "default",
-        run_name: Optional[str] = None,
-        log_dir: str = "./logs",
-    ):
-        self.experiment_name = experiment_name
-        self.run_name = run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+    JSONL is append-only and crash tolerant: a job killed mid-write loses at most the
+    last line, and a resumed run simply keeps appending to the same file.
+    """
 
-        self._metrics_file = self.log_dir / f"{experiment_name}_{self.run_name}.jsonl"
-        self._step = 0
+    def __init__(self, run_dir: Union[str, Path], enabled: bool = True):
+        self.run_dir = Path(run_dir)
+        self.enabled = enabled
+        self.metrics_file = self.run_dir / "metrics.jsonl"
+        if enabled:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"MetricsLogger initialized: {self._metrics_file}")
-
-    def log(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
-        """Log metrics."""
-        step = step if step is not None else self._step
-        self._step = step + 1
-
-        entry = {
-            "step": step,
-            "timestamp": datetime.now().isoformat(),
-            **metrics,
-        }
-
-        with open(self._metrics_file, "a") as f:
+    def log(self, metrics: Dict[str, Any], step: int, event: Optional[str] = None) -> None:
+        if not self.enabled:
+            return
+        entry: Dict[str, Any] = {"step": int(step), "time": datetime.now(timezone.utc).isoformat()}
+        if event:
+            entry["event"] = event
+        entry.update(_jsonable(metrics))
+        with open(self.metrics_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
     def log_hyperparameters(self, params: Dict[str, Any]) -> None:
-        """Log hyperparameters."""
-        params_file = self.log_dir / f"{self.experiment_name}_{self.run_name}_params.json"
-        with open(params_file, "w") as f:
-            json.dump(params, f, indent=2, default=str)
+        if not self.enabled:
+            return
+        (self.run_dir / "hparams.json").write_text(json.dumps(_jsonable(params), indent=2))
 
-    def get_metrics(self) -> list:
-        """Get all logged metrics."""
-        if not self._metrics_file.exists():
-            return []
+    def read(self) -> List[Dict[str, Any]]:
+        return read_metrics(self.metrics_file)
 
-        metrics = []
-        with open(self._metrics_file, "r") as f:
-            for line in f:
-                metrics.append(json.loads(line))
-        return metrics
+
+def read_metrics(path: Union[str, Path], tail: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Read a metrics JSONL file, skipping a torn last line from a crash."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    entries = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.debug("Skipping malformed metrics line in %s", path)
+    return entries[-tail:] if tail else entries
