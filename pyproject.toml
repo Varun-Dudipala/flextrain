@@ -4,42 +4,42 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flextrain"
-version = "0.1.0"
-description = "Fault-tolerant distributed training framework with async checkpointing"
+version = "0.2.0"
+description = "Fault-tolerant distributed training for PyTorch: async checkpointing, elastic resume, coordinated preemption"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Varun Dudipala"}
 ]
-keywords = ["deep-learning", "distributed-training", "pytorch", "fsdp", "fault-tolerance"]
+keywords = ["deep-learning", "distributed-training", "pytorch", "fsdp", "ddp", "fault-tolerance", "checkpointing"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.0.0",
+    "torch>=2.3",
     "pyyaml>=6.0",
     "typer>=0.9.0",
+    "rich>=13.0.0",
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
-    "aiosqlite>=0.19.0",
-    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "black>=23.0.0",
-    "ruff>=0.0.280",
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "httpx>=0.24",
+    "numpy",
+    "ruff>=0.5",
 ]
 gcs = ["google-cloud-storage>=2.10.0"]
 s3 = ["boto3>=1.28.0"]
@@ -54,3 +54,31 @@ Repository = "https://github.com/Varun-Dudipala/flextrain"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["flextrain*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: multi-process tests that launch torchrun workers (slower)",
+    "gpu: requires CUDA",
+]
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "UP006", "UP007", "UP035", "UP045",  # keep typing.Optional/List style for readability
+    "B008",  # typer.Option(...) in argument defaults is the Typer idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B017"]
+"flextrain/api/dashboard.py" = ["E501"]  # embedded HTML/JS
+
+[tool.coverage.run]
+source = ["flextrain"]
