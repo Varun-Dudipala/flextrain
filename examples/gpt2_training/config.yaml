@@ -1,37 +1,48 @@
+# Byte-level GPT-2 on this repository's source code. CPU-friendly defaults;
+# for GPT-2 small on a GPU: --set model.size=small --set data.seq_len=512
 main:
-  experiment_name: gpt2_training
+  experiment_name: gpt2-bytes
   output_dir: ./outputs
   seed: 42
 
+model:            # free-form: passed to create_gpt2_model(size, **rest)
+  size: tiny      # tiny | small | medium | large
+  vocab_size: 256 # byte-level tokens
+
+data:             # free-form: read by train_gpt2.py
+  seq_len: 128
+  paths: []       # text files / globs; empty -> this repository's Python sources
+
 training:
-  model_name: gpt2-small
-  batch_size: 8
-  micro_batch_size: 4
-  gradient_accumulation_steps: 2
-  learning_rate: 3e-4
-  weight_decay: 0.01
-  max_steps: 10000
-  warmup_steps: 500
-  max_seq_length: 512
+  batch_size: 16           # per-device micro-batch
+  global_batch_size: 32    # accumulation is derived from the world size, so resizing keeps this fixed
+  learning_rate: 1e-3
+  weight_decay: 0.1
+  warmup_steps: 20
+  lr_scheduler: cosine
+  min_lr_ratio: 0.1
+  max_steps: 300
+  max_grad_norm: 1.0
   log_interval: 10
-  save_interval: 500
+  eval_interval: 100
+  eval_max_batches: 20
+  num_workers: 0
 
 distributed:
-  strategy: fsdp
-  mixed_precision: true
-  mixed_precision_dtype: bf16
-  activation_checkpointing: true
+  strategy: ddp                 # fsdp for sharded training (CUDA only)
+  mixed_precision: true         # CUDA only; ignored on CPU
+  mixed_precision_dtype: bf16   # use fp16 on GPUs without bf16 (e.g. T4, V100)
+  wrap_modules: [GPT2Block]     # FSDP units / activation-checkpoint boundaries
+  activation_checkpointing: false
 
 checkpoint:
-  checkpoint_dir: ./checkpoints
-  async_save: true
+  save_interval_steps: 100
   keep_last_n: 3
-  keep_best_n: 2
-  best_metric: loss
-  best_mode: min
+  async_save: true
 
 elastic:
-  min_nodes: 1
-  max_nodes: 4
-  allow_elastic_scaling: false
+  nproc_per_node: 1
   max_restarts: 3
+
+fault_tolerance:
+  handle_signals: true
