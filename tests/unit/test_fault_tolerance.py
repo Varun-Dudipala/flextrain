@@ -52,6 +52,90 @@ class TestPreemptionHandler:
         assert handler.should_stop() and handler.received_signal == "SIGTERM"
 
 
+# Run in a child process: the watchdog's job is to exit the process it lives in.
+WATCHDOG_SCRIPT = """
+import os, signal, sys, time
+from flextrain.fault_tolerance import PreemptionHandler
+mode = sys.argv[1]
+handler = PreemptionHandler(['SIGTERM'], grace_seconds=1.0)
+handler.install()
+os.kill(os.getpid(), signal.SIGTERM)
+deadline = time.monotonic() + 3.0
+if mode == 'agreed':
+    handler.stop_agreed()
+if mode == 'blocked':
+    # Like a rank whose peer died: the main thread sits inside a C++ call that does not return
+    # to the interpreter, so the Python-level signal handler cannot run at all.
+    from datetime import timedelta
+    import torch.distributed as dist
+    store = dist.TCPStore('127.0.0.1', 0, 1, is_master=True, timeout=timedelta(seconds=20))
+    try:
+        store.get('never-set')
+    except Exception:
+        pass
+    print('unblocked after the full timeout')
+while time.monotonic() < deadline:
+    if mode == 'progress':
+        handler.heartbeat()
+    if mode == 'busy':
+        with handler.busy():
+            time.sleep(3.0)
+    time.sleep(0.05)
+print('survived')
+"""
+
+
+class TestStopWatchdog:
+    """A rank blocked in a C++ collective cannot run a Python signal handler. With the handler
+    installed it would ignore the agent's SIGTERM for the whole shutdown timeout."""
+
+    def run_mode(self, mode):
+        import subprocess
+        import sys
+
+        return subprocess.run([sys.executable, "-c", WATCHDOG_SCRIPT, mode], capture_output=True, text=True, timeout=60)
+
+    @pytest.mark.parametrize("mode", ["stuck", "blocked"])
+    def test_a_rank_that_makes_no_progress_after_the_signal_exits(self, mode):
+        """'blocked' is the case that matters: the main thread is inside C++ for 20 s and cannot
+        run the Python handler, so the watchdog has to learn of the signal some other way."""
+        import time
+
+        started = time.monotonic()
+        proc = self.run_mode(mode)
+        assert proc.returncode == 128 + signal.SIGTERM, proc.stderr
+        assert "survived" not in proc.stdout and "unblocked" not in proc.stdout
+        assert "No progress" in proc.stderr and "Received SIGTERM" in proc.stderr
+        assert time.monotonic() - started < 15, "exited only when the blocking call timed out"
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+    def test_forked_children_do_not_inherit_the_handler_or_the_wakeup_pipe(self):
+        """A DataLoader worker is not a rank: SIGTERM must kill it as usual, and a signal sent to it
+        must not show up in the parent's watchdog as the parent's own."""
+        with PreemptionHandler(["SIGTERM"], grace_seconds=30):
+            pid = os.fork()
+            if pid == 0:  # child
+                ok = signal.getsignal(signal.SIGTERM) == signal.SIG_DFL and signal.set_wakeup_fd(-1) == -1
+                os._exit(0 if ok else 1)
+            assert os.waitpid(pid, 0)[1] == 0
+            assert signal.getsignal(signal.SIGTERM) != signal.SIG_DFL  # the parent keeps its handler
+
+    @pytest.mark.parametrize("mode", ["progress", "agreed", "busy"])
+    def test_a_rank_that_is_working_is_left_alone(self, mode):
+        """Still stepping towards the stop, already agreed and saving, or inside a long save."""
+        proc = self.run_mode(mode)
+        assert proc.returncode == 0 and "survived" in proc.stdout, proc.stderr
+
+    def test_disabled_without_a_grace_period(self):
+        handler = PreemptionHandler(["SIGUSR1"])  # grace_seconds=None
+        with handler:
+            os.kill(os.getpid(), signal.SIGUSR1)
+            import time
+
+            time.sleep(0.6)  # several watchdog polls
+            assert handler.stop_requested
+
+
 class TestNonFiniteGuard:
     def test_finite_steps_pass(self):
         guard = NonFiniteGuard(max_consecutive=2)

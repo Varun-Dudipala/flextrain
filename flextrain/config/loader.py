@@ -101,6 +101,39 @@ class Config:
         return str(self.experiment_dir / "checkpoints")
 
 
+# Settings that define what a run computes. Continuing a lineage with different values is refused
+# by default (``checkpoint.allow_config_change``). Operational settings - logging, evaluation and
+# checkpoint cadence, workers, per-device batch size, topology - may change freely.
+_RESUME_CRITICAL = {
+    "main": ("seed",),
+    "training": ("optimizer", "learning_rate", "weight_decay", "beta1", "beta2", "eps", "momentum",
+                 "lr_scheduler", "warmup_steps", "min_lr_ratio", "max_grad_norm", "global_batch_size"),
+    "distributed": ("mixed_precision", "mixed_precision_dtype"),
+}
+_SCHEDULE_LENGTH = ("max_steps", "max_epochs")  # these shape a decaying LR schedule
+
+
+def resume_critical_settings(config: Dict[str, Any]) -> Dict[str, Any]:
+    """The run-defining subset of a config mapping (``Config.to_dict()`` layout), as flat keys."""
+    out: Dict[str, Any] = {}
+    for section, keys in _RESUME_CRITICAL.items():
+        values = config.get(section) or {}
+        out.update({f"{section}.{key}": values.get(key) for key in keys})
+    training = config.get("training") or {}
+    if training.get("lr_scheduler") != "constant":
+        out.update({f"training.{key}": training.get(key) for key in _SCHEDULE_LENGTH})
+    for name in _FREEFORM:
+        out[name] = config.get(name) or {}
+    return out
+
+
+def config_changes(saved: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, tuple]:
+    """Run-defining settings that differ: ``{key: (value in the checkpoint, value now)}``."""
+    before, now = resume_critical_settings(saved), resume_critical_settings(current)
+    return {key: (before.get(key), now.get(key)) for key in sorted(set(before) | set(now))
+            if before.get(key) != now.get(key)}
+
+
 def _parse_override(item: str) -> tuple:
     key, sep, raw = item.partition("=")
     key = key.strip()
@@ -138,10 +171,12 @@ def load_config(
     overrides = list(overrides or [])
     if path is None:
         path = os.environ.get(CONFIG_ENV_VAR)
-        if not path:
-            raise ConfigError(f"no config path given and ${CONFIG_ENV_VAR} is not set")
         env_overrides = [line for line in os.environ.get(OVERRIDES_ENV_VAR, "").splitlines() if line.strip()]
         overrides = env_overrides + overrides
+        if not path:
+            if env_overrides:  # `flextrain launch --set ...` without a config file: defaults + overrides
+                return Config.from_dict(apply_overrides({}, overrides))
+            raise ConfigError(f"no config path given and ${CONFIG_ENV_VAR} is not set")
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Configuration file not found: {path}")
@@ -164,6 +199,7 @@ __all__ = [
     "CONFIG_ENV_VAR",
     "OVERRIDES_ENV_VAR",
     "apply_overrides",
+    "config_changes",
     "create_default_config",
     "load_config",
 ]

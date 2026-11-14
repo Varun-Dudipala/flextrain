@@ -47,7 +47,7 @@ def test_async_checkpoint_resume_on_gpu(make_config):
     first = Trainer(TinyModel(), make_config(10), RegressionDataset())
     first.train()
     first.close()
-    resumed = Trainer(TinyModel(), make_config(20), RegressionDataset())
+    resumed = Trainer(TinyModel(), make_config(20, checkpoint={"allow_config_change": True}), RegressionDataset())
     result = resumed.train()
     assert resumed.resumed_from.endswith("checkpoint_step00000010.pt")
     assert result.global_step == 20 and all(p.device.type == "cuda" for p in resumed.model.parameters())

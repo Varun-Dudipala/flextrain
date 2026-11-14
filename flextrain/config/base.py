@@ -196,3 +196,5 @@ class FlexTrainConfig(BaseConfig):
             if value is not None:
                 _require("/" not in value and "\\" not in value,
                          f"main.{name} must not contain path separators, got {value!r}")
+                _require(value not in (".", ".."),
+                         f"main.{name} must not be {value!r} (it is used as a directory name)")

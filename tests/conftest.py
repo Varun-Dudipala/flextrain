@@ -17,7 +17,8 @@ from flextrain.config import Config
 def _isolate_environment(tmp_path, monkeypatch):
     """Keep the run registry and launcher env vars out of the user's home / shell."""
     monkeypatch.setenv("FLEXTRAIN_HOME", str(tmp_path / "flextrain_home"))
-    for var in ("FLEXTRAIN_CONFIG", "FLEXTRAIN_OVERRIDES", "WORLD_SIZE", "RANK", "LOCAL_RANK",
+    for var in ("FLEXTRAIN_CONFIG", "FLEXTRAIN_OVERRIDES", "FLEXTRAIN_LAUNCH_ID", "FLEXTRAIN_RUN_NAME",
+                "WORLD_SIZE", "RANK", "LOCAL_RANK",
                 "TORCHELASTIC_RESTART_COUNT", "TORCHELASTIC_RUN_ID", "TORCHELASTIC_MAX_RESTARTS"):
         monkeypatch.delenv(var, raising=False)
     yield
@@ -40,6 +41,26 @@ class RegressionDataset(Dataset):
         g = torch.Generator().manual_seed(i)
         x = torch.randn(self.dim, generator=g)
         return {"x": x, "y": x.sum(-1, keepdim=True)}
+
+
+class NoisyDataset(Dataset):
+    """Regression data with random augmentation drawn from all three global RNGs."""
+
+    def __init__(self, n: int = 64, dim: int = 8):
+        self.n, self.dim = n, dim
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, i: int):
+        import random
+
+        import numpy as np
+
+        g = torch.Generator().manual_seed(i)
+        x = torch.randn(self.dim, generator=g)
+        noise = torch.randn(self.dim) * 0.1 + random.random() * 0.01 + float(np.random.rand()) * 0.01
+        return {"x": x + noise, "y": x.sum(-1, keepdim=True)}
 
 
 class TinyModel(nn.Module):

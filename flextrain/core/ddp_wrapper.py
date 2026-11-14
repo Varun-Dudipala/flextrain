@@ -25,7 +25,3 @@ class DDPWrapper:
             gradient_as_bucket_view=config.gradient_as_bucket_view,
             static_graph=config.static_graph,
         )
-
-    @staticmethod
-    def unwrap(model: nn.Module) -> nn.Module:
-        return model.module if isinstance(model, DDP) else model

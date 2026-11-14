@@ -4,8 +4,9 @@ One ``Trainer`` runs unchanged on a single CPU, one GPU, or many nodes launched 
 ``torchrun`` / ``flextrain launch``. What it guarantees:
 
 * **Exact resume.** A checkpoint holds model, optimizer, LR scheduler, grad scaler, the
-  sampler's global data position and every rank's RNG state. Training N steps straight
-  and training k steps, crashing, and resuming produce bit-identical weights (tested).
+  sampler's global data position and every rank's RNG state, and data augmentation is
+  seeded per sample. Training N steps straight and training k steps, crashing, and
+  resuming produce bit-identical weights (tested, including with DataLoader workers).
 * **Elastic resume.** Resuming at a different world size continues from the same global
   sample, and with ``training.global_batch_size`` the global batch is unchanged.
 * **Non-blocking checkpoints.** With ``checkpoint.async_save`` the step loop pauses only
@@ -35,11 +36,26 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, SequentialSampler
 
-from flextrain.checkpoint import CheckpointManager, capture_rng_state, restore_rng_state, restore_state
-from flextrain.config import Config, ConfigError
+from flextrain.checkpoint import (
+    CheckpointManager,
+    capture_rng_state,
+    restore_rng_state,
+    restore_state,
+)
+from flextrain.config import Config, ConfigError, config_changes
 from flextrain.elastic import ElasticManager
 from flextrain.fault_tolerance import NonFiniteGuard, PreemptionHandler
-from flextrain.tracking import COMPLETED, FAILED, PREEMPTED, RUNNING, MetricsLogger, RunRegistry, make_run_id
+from flextrain.tracking import (
+    COMPLETED,
+    FAILED,
+    LAUNCH_ID_ENV_VAR,
+    PREEMPTED,
+    RUN_NAME_ENV_VAR,
+    RUNNING,
+    MetricsLogger,
+    RunRegistry,
+    make_run_id,
+)
 from flextrain.utils import set_seed, setup_logging, teardown_file_logging
 
 from .data_loader import ResumableDistributedSampler, build_dataloader
@@ -75,7 +91,8 @@ def _move_to_device(batch: Any, device: torch.device) -> Any:
     if isinstance(batch, Mapping):
         return {k: _move_to_device(v, device) for k, v in batch.items()}
     if isinstance(batch, (list, tuple)):
-        return type(batch)(_move_to_device(v, device) for v in batch)
+        moved = [_move_to_device(v, device) for v in batch]
+        return type(batch)(*moved) if hasattr(batch, "_fields") else type(batch)(moved)  # namedtuple vs. plain
     return batch
 
 
@@ -160,7 +177,8 @@ class Trainer:
         )
         pin = tc.pin_memory and self.device.type == "cuda"
         self.train_loader = build_dataloader(train_dataset, self.sampler, tc.batch_size, tc.num_workers,
-                                             pin, collate_fn, seed=config.main.seed + self.rank)
+                                             pin, collate_fn, seed=config.main.seed + self.rank,
+                                             sample_seed=config.main.seed if tc.seed_per_sample else None)
         self.eval_loader = self._build_eval_loader(eval_dataset, collate_fn, pin) if eval_dataset is not None else None
 
         # ---- optimization
@@ -170,7 +188,7 @@ class Trainer:
 
         # ---- fault tolerance & checkpointing
         ft = config.fault_tolerance
-        self.preemption = PreemptionHandler(ft.signals) if ft.handle_signals else None
+        self.preemption = PreemptionHandler(ft.signals, ft.stop_grace_seconds) if ft.handle_signals else None
         self.nonfinite_guard = NonFiniteGuard(ft.max_consecutive_nonfinite, enabled=ft.skip_nonfinite_steps)
         self.checkpoint_manager = CheckpointManager(
             config.checkpoint, rank=self.rank, world_size=self.world_size,
@@ -185,6 +203,7 @@ class Trainer:
         self.run_id: Optional[str] = None
         self.metrics_logger: Optional[MetricsLogger] = None
         self.resumed_from: Optional[str] = None
+        self.lineage: Optional[str] = None  # id of the training history this run belongs to
         self.last_metrics: Dict[str, float] = {}
         self._last_checkpoint: Optional[str] = None
         self._last_checkpoint_time = time.monotonic()
@@ -205,10 +224,23 @@ class Trainer:
             logger.info("mixed_precision ignored: only supported on CUDA devices")
             return None
         dtype = PRECISION_DTYPES[dc.mixed_precision_dtype]
-        if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
-            logger.warning("bf16 not supported on this GPU; falling back to fp16 with loss scaling")
+        if dtype == torch.bfloat16 and not self._native_bf16():
+            logger.warning("bf16 not natively supported on this GPU; falling back to fp16 with loss scaling")
             dtype = torch.float16
         return dtype
+
+    @staticmethod
+    def _native_bf16() -> bool:
+        """Whether the GPU has real bf16 arithmetic.
+
+        ``torch.cuda.is_bf16_supported()`` answers True on older GPUs (T4, V100) as well, because
+        by default it counts slow software emulation. Ask for native support only; torch versions
+        without that argument reported native support in the first place.
+        """
+        try:
+            return torch.cuda.is_bf16_supported(including_emulation=False)
+        except TypeError:
+            return torch.cuda.is_bf16_supported()
 
     @property
     def _is_fsdp(self) -> bool:
@@ -345,14 +377,20 @@ class Trainer:
         if self.scaler is not None:
             self.scaler.unscale_(self.optimizer)
         grad_norm = self._clip_and_get_grad_norm()
-        skipped = False
+        # One guard for every precision. The fp16 scaler also skips a non-finite step on its
+        # own, but silently and without limit; counting it here means persistent divergence
+        # raises under fp16 exactly as it does under fp32 / bf16. (A scaler that is merely
+        # calibrating halves its scale per skip, so it recovers well inside the limit.)
+        skipped = self.nonfinite_guard.should_skip(grad_norm, self.global_step + 1)
         if self.scaler is not None:
-            self.scaler.step(self.optimizer)  # the scaler skips inf/nan steps itself
-            self.scaler.update()
-        else:
-            skipped = self.nonfinite_guard.should_skip(grad_norm, self.global_step + 1)
             if not skipped:
-                self.optimizer.step()
+                # (The scaler itself also refuses to step if unscale_ found inf/nan gradients.) When
+                # the guard skipped, do not call it at all: finite gradients whose *norm* overflows
+                # would otherwise still get a weight-decay-only update.
+                self.scaler.step(self.optimizer)
+            self.scaler.update()  # lowers the loss scale after an overflow
+        elif not skipped:
+            self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         # Always advance the schedule so that scheduler step == global step (resume invariant).
         with warnings.catch_warnings():
@@ -373,7 +411,7 @@ class Trainer:
                 status == PREEMPTED or self.config.checkpoint.save_final
             ):
                 self.save_checkpoint(blocking=True)
-            self.checkpoint_manager.wait_for_pending()
+            self._agree(self.checkpoint_manager.wait_for_pending, "a background checkpoint write failed")
         except BaseException as e:
             self._update_registry(status=FAILED, error=f"{type(e).__name__}: {e}")
             raise
@@ -381,8 +419,8 @@ class Trainer:
             if installed:
                 self.preemption.uninstall()
 
-        self._update_registry(status=status, step=self.global_step, finished_at=time.time(),
-                              last_checkpoint=self._last_checkpoint)
+        self._record_durable_checkpoint()
+        self._update_registry(status=status, step=self.global_step, finished_at=time.time())
         if self.metrics_logger is not None:
             self.metrics_logger.log({"status": status}, step=self.global_step, event="end")
         logger.info("Training %s at step %d (epoch %d)", status, self.global_step, self.epoch)
@@ -403,6 +441,8 @@ class Trainer:
                 micro_step += 1
                 boundary = micro_step % self.accumulation_steps == 0
                 loss = self._forward_backward(batch, sync_gradients=boundary)
+                if self.preemption is not None:
+                    self.preemption.heartbeat()
                 self._window_loss_sum += loss.float()
                 self._window_micro_batches += 1
                 self._window_tokens += _count_tokens(batch)
@@ -444,6 +484,7 @@ class Trainer:
             stop_v, due_v = all_reduce_tensor([local_stop, local_due], op="max")
             stop, time_due = stop_v > 0, due_v > 0
         if stop:
+            self.preemption.stop_agreed()
             logger.warning("Stop requested (signal %s on some rank): checkpointing at step %d",
                            self.preemption.received_signal or "remote", step)
             return True
@@ -465,6 +506,8 @@ class Trainer:
                     break
                 with self._autocast():
                     loss = self.compute_loss(_move_to_device(batch, self.device))
+                if self.preemption is not None:
+                    self.preemption.heartbeat()
                 total += float(loss)
                 count += 1
         finally:
@@ -546,43 +589,124 @@ class Trainer:
             "grad_scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "global_batch": self.global_batch,
             "config": self.config.to_dict(),
+            "lineage": self.lineage,
             "flextrain_version": __version__,
         }
-        path = self.checkpoint_manager.save(
-            self.model, self.optimizer, self.lr_scheduler, step=self.global_step, epoch=self.epoch,
-            metrics={k: v for k, v in self.last_metrics.items() if isinstance(v, (int, float))},
-            extra=extra, blocking=blocking,
-        )
+        # A save legitimately makes no step progress; the stop watchdog must not mistake it for a hang.
+        with self.preemption.busy() if self.preemption is not None else contextlib.nullcontext():
+            path = self._save_agreed(extra, blocking)
         self._last_checkpoint_time = time.monotonic()
-        if path is not None:
-            self._last_checkpoint = path
-            self._update_registry(last_checkpoint=path, last_checkpoint_step=self.global_step)
+        self._record_durable_checkpoint()
         return path
 
-    def _resume(self) -> None:
-        cc = self.config.checkpoint
-        if cc.resume_path is None and not cc.auto_resume:
+    def _save_agreed(self, extra: Dict[str, Any], blocking: bool) -> Optional[str]:
+        return self._agree(
+            lambda: self.checkpoint_manager.save(
+                self.model, self.optimizer, self.lr_scheduler, step=self.global_step, epoch=self.epoch,
+                metrics={k: v for k, v in self.last_metrics.items() if isinstance(v, (int, float))},
+                extra=extra, blocking=blocking,
+            ),
+            "saving a checkpoint failed",
+        )
+
+    def _agree(self, action: Callable[[], Any], what: str) -> Any:
+        """Run ``action`` on this rank, then make every rank agree on whether it worked anywhere.
+
+        Storage is rank-local: only rank 0 writes checkpoints, and each rank reads its own copy
+        on resume. If one rank raised and the others carried on, they would walk into the next
+        collective without it and hang until the process-group timeout. One all-reduce turns a
+        failure on any rank into an exception on every rank.
+        """
+        result, error = None, None
+        try:
+            result = action()
+        except Exception as e:
+            error = e
+        failed_somewhere = all_reduce_tensor([1.0 if error is not None else 0.0], op="max")[0] > 0
+        if error is not None:
+            raise error
+        if failed_somewhere:
+            raise RuntimeError(f"{what} on another rank")
+        return result
+
+    def _record_durable_checkpoint(self) -> None:
+        """Report the newest checkpoint that is actually on storage (not merely queued)."""
+        durable = self.checkpoint_manager.last_committed
+        if durable is not None and durable.path != self._last_checkpoint:
+            self._last_checkpoint = durable.path
+            self._update_registry(last_checkpoint=durable.path, last_checkpoint_step=durable.step)
+
+    def _choose_resume_point(self, launch_id: Optional[str]) -> tuple:
+        """Rank 0: decide where this incarnation starts. Returns ``(mode, path, state)``.
+
+        * ``continue`` - carry on the directory's lineage from its newest usable checkpoint.
+          Chosen for a restart within the same launch whatever the config says, and otherwise
+          when ``auto_resume`` is on - including when ``resume_path`` is set but the lineage that
+          was branched from it already has checkpoints of its own (going back to ``resume_path``
+          then would discard everything trained since).
+        * ``branch`` - start a new lineage from ``resume_path``.
+        * ``fresh`` - start a new lineage from scratch.
+        """
+        cc, mgr = self.config.checkpoint, self.checkpoint_manager
+        manifest = mgr.stored_manifest()
+        same_launch = bool(launch_id and manifest is not None and manifest.launch_id == launch_id)
+        already_branched = bool(cc.resume_path and manifest is not None and manifest.origin == cc.resume_path
+                                and manifest.checkpoints)
+        if same_launch or (cc.auto_resume and (cc.resume_path is None or already_branched)):
+            found = mgr.load_latest_state()
+            if found is not None:
+                return ("continue", *found)
+        if cc.resume_path is not None:
+            return "branch", cc.resume_path, mgr.load_state(cc.resume_path)
+        return "fresh", None, None
+
+    def _check_config_unchanged(self, state: Dict[str, Any], path: str) -> None:
+        changes = config_changes(state.get("config") or {}, self.config.to_dict()) if state.get("config") else {}
+        if not changes:
             return
-        state, path, error = None, None, None
+        listing = "; ".join(f"{key}: {old!r} -> {new!r}" for key, (old, new) in changes.items())
+        if self.config.checkpoint.allow_config_change:
+            logger.warning("Continuing %s with changed settings (%s). Optimizer and schedule state come from "
+                           "the checkpoint; the new values apply only where they are read again.", path, listing)
+            return
+        raise ConfigError(
+            f"the config differs from the one {path} was written with ({listing}). Continuing would silently "
+            f"mix checkpointed state with the new settings. To continue anyway set "
+            f"checkpoint.allow_config_change=true; to start over use a new experiment_name / checkpoint_dir, "
+            f"or checkpoint.auto_resume=false."
+        )
+
+    def _resume(self) -> None:
+        cc, mgr = self.config.checkpoint, self.checkpoint_manager
+        launch_id = os.environ.get(LAUNCH_ID_ENV_VAR)
+        mode, path, state, error = "fresh", None, None, None
         if self.is_main_process:
             try:
-                if cc.resume_path is not None:
-                    path, state = cc.resume_path, self.checkpoint_manager.load_state(cc.resume_path)
-                else:
-                    found = self.checkpoint_manager.load_latest_state()
-                    if found is not None:
-                        path, state = found
+                mode, path, state = self._choose_resume_point(launch_id)
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
-        # Every rank resumes from the checkpoint rank 0 validated (or fails together).
-        path, error = broadcast_object((path, error))
+        # Every rank starts from the checkpoint rank 0 chose, or fails with it.
+        mode, path, error = broadcast_object((mode, path, error))
         if error is not None:
-            raise RuntimeError(f"cannot resume from {cc.resume_path}: {error}")
+            raise RuntimeError(f"cannot resume: {error}")
+        if path is not None and state is None:
+            # Each rank reads its own copy; one that cannot must take the others down with it.
+            state = self._agree(lambda: mgr.load_state(path), f"loading {path} failed")
+        elif path is not None:
+            self._agree(lambda: None, f"loading {path} failed")
+
+        lineage = None
+        if self.is_main_process:
+            if mode == "continue":
+                lineage = mgr.continue_lineage(int(state["step"]), launch_id=launch_id, lineage=state.get("lineage"))
+            else:
+                lineage = mgr.open_lineage(origin=path, launch_id=launch_id)
+        self.lineage = broadcast_object(lineage)
         if path is None:
-            logger.info("No checkpoint to resume from; starting fresh")
+            logger.info("No checkpoint to resume from; starting fresh (lineage %s)", self.lineage[:8])
             return
-        if state is None:
-            state = self.checkpoint_manager.load_state(path)
+        if mode == "continue":
+            self._check_config_unchanged(state, path)
 
         restore_state(state, self.model, self.optimizer, self.lr_scheduler, strict=cc.strict_resume)
         ts = state["trainer"]
@@ -605,14 +729,18 @@ class Trainer:
                                 "global_batch": state.get("global_batch")})
         self.resumed_from = path
         self.checkpoint_manager.last_saved_step = self.global_step
-        logger.info("Resumed from %s at step %d (epoch %d, %d samples into the epoch)",
-                    path, self.global_step, self.epoch, self.sampler.consumed)
+        logger.info("%s %s at step %d (epoch %d, %d samples into the epoch; lineage %s)",
+                    "Continuing from" if mode == "continue" else "Branching a new lineage from",
+                    path, self.global_step, self.epoch, self.sampler.consumed, self.lineage[:8])
 
     # ================================================================== run bookkeeping
     def _start_run(self) -> None:
         mc = self.config.main
         if self.run_name is None:
-            self.run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+            # Not configured and not inherited from a checkpoint: the launch's name, else "now".
+            self.run_name = os.environ.get(RUN_NAME_ENV_VAR) or datetime.now().strftime("%Y%m%d-%H%M%S")
+            if "/" in self.run_name or "\\" in self.run_name:
+                raise ConfigError(f"${RUN_NAME_ENV_VAR} must not contain path separators, got {self.run_name!r}")
         self.run_name = broadcast_object(self.run_name)
         self.run_id = make_run_id(mc.experiment_name, self.run_name)
         self.run_dir = self.config.experiment_dir / "runs" / self.run_name
@@ -629,6 +757,7 @@ class Trainer:
         existing = self.registry.get(self.run_id) if self.registry is not None else None
         self._update_registry(
             status=RUNNING, experiment=mc.experiment_name, run_name=self.run_name, pid=os.getpid(),
+            launch_id=os.environ.get(LAUNCH_ID_ENV_VAR),
             host=socket.gethostname(), world_size=self.world_size, global_batch=self.global_batch,
             gradient_accumulation_steps=self.accumulation_steps, step=self.global_step, epoch=self.epoch,
             max_steps=self.config.training.max_steps, max_epochs=self.config.training.max_epochs,
@@ -640,22 +769,21 @@ class Trainer:
 
     def close(self) -> None:
         """Drain checkpoint writes, release resources and tear down the process group we created."""
-        self.checkpoint_manager.close()
-        teardown_file_logging()
-        if self._owns_process_group:
-            destroy_distributed()
+        self._close(raise_errors=True)
+
+    def _close(self, raise_errors: bool) -> None:
+        try:
+            self.checkpoint_manager.close(raise_errors=raise_errors)  # may raise a failed background write
+        finally:
+            teardown_file_logging()
+            if self._owns_process_group:
+                destroy_distributed()
 
     def __enter__(self) -> Trainer:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self.close()
-        else:
-            self.checkpoint_manager.close(raise_errors=False)
-            teardown_file_logging()
-            if self._owns_process_group:
-                destroy_distributed()
+        self._close(raise_errors=exc_type is None)  # do not mask the exception already in flight
 
 
 # Backwards-compatible name

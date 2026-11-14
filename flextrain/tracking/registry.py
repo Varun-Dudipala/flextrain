@@ -18,10 +18,16 @@ from typing import Any, Dict, List, Optional, Union
 from .metrics import _jsonable
 
 HOME_ENV_VAR = "FLEXTRAIN_HOME"
+# Set by ``flextrain launch`` for its workers and stored in the run record, so the launcher can
+# find the runs it started and give them a final status if the workers die without writing one.
+LAUNCH_ID_ENV_VAR = "FLEXTRAIN_LAUNCH_ID"
+# Default run name for the workers of one launch. A run normally keeps its name across restarts
+# through its checkpoints; this covers a restart that has no checkpoint to read it from yet
+# (killed before the first save), which would otherwise register as a second, new run.
+RUN_NAME_ENV_VAR = "FLEXTRAIN_RUN_NAME"
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 RUNNING, COMPLETED, PREEMPTED, FAILED = "running", "completed", "preempted", "failed"
-STATUSES = (RUNNING, COMPLETED, PREEMPTED, FAILED)
 
 
 def default_home() -> Path:

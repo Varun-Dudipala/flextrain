@@ -35,10 +35,26 @@ class CheckpointConfig(BaseConfig):
 
     save_optimizer: bool = True
 
+    # Integrity: write a SHA-256 digest next to every checkpoint and verify it on load, so a
+    # checkpoint whose bytes changed on storage is skipped instead of silently resumed from.
+    checksum: bool = True
+    # Loading reconstructs tensors and plain containers only, never arbitrary pickled objects
+    # (unpickling can execute code, and a checkpoint location is often writable by others). Set
+    # this to load checkpoints that need full unpickling: those written by FlexTrain <= 0.2, or
+    # holding custom scheduler / optimizer state. Only do so for files you trust.
+    allow_pickle: bool = False
+
     # Resume
     auto_resume: bool = True  # resume from the newest valid checkpoint in checkpoint_dir
-    resume_path: Optional[str] = None  # explicit checkpoint to resume from (overrides auto_resume)
+    # Checkpoint to branch a *new* lineage from (e.g. to roll back past a loss spike). It is the
+    # starting point, not a standing order: once that lineage has checkpoints of its own, a
+    # restart continues from the newest of them instead of going back to resume_path.
+    resume_path: Optional[str] = None
     strict_resume: bool = True  # strict model state-dict key matching
+    # Continuing a lineage with different optimization settings (learning rate, schedule, seed,
+    # model / data sections, ...) than its checkpoint was written with is refused unless this is
+    # set: the settings in effect would otherwise be a silent mix of old state and new config.
+    allow_config_change: bool = False
 
     @classmethod
     def section_name(cls) -> str:

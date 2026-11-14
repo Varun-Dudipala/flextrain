@@ -1,0 +1,829 @@
+{
+  "environment": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "python": "3.11.12",
+    "torch": "2.15.0"
+  },
+  "settings": {
+    "trials": 40,
+    "max_kills": 3,
+    "seed": 1000,
+    "max_steps": 60,
+    "ranks": 2
+  },
+  "reference_digest": "aeafd14a1c49ad1d7cf14cc19b0ba9e1b91f296ebe54693a24670db0701aec22",
+  "passed": 40,
+  "kills_delivered": 75,
+  "trials": [
+    {
+      "seed": 1000,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 43,
+          "incarnation": 0,
+          "delivered_at_step": 43
+        },
+        {
+          "rank": 1,
+          "planned_step": 49,
+          "incarnation": 1,
+          "delivered_at_step": 49
+        }
+      ],
+      "restarts": 2,
+      "seconds": 25.7,
+      "failures": []
+    },
+    {
+      "seed": 1001,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 49,
+          "incarnation": 0,
+          "delivered_at_step": 49
+        }
+      ],
+      "restarts": 1,
+      "seconds": 18.4,
+      "failures": []
+    },
+    {
+      "seed": 1002,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 27,
+          "incarnation": 0,
+          "delivered_at_step": 27
+        },
+        {
+          "rank": 0,
+          "planned_step": 39,
+          "incarnation": 1,
+          "delivered_at_step": 39
+        },
+        {
+          "rank": 0,
+          "planned_step": 58,
+          "incarnation": 2,
+          "delivered_at_step": 58
+        }
+      ],
+      "restarts": 3,
+      "seconds": 31.0,
+      "failures": []
+    },
+    {
+      "seed": 1003,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 24,
+          "incarnation": 0,
+          "delivered_at_step": 24
+        },
+        {
+          "rank": 1,
+          "planned_step": 36,
+          "incarnation": 1,
+          "delivered_at_step": 36
+        }
+      ],
+      "restarts": 2,
+      "seconds": 24.3,
+      "failures": []
+    },
+    {
+      "seed": 1004,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 7,
+          "incarnation": 0,
+          "delivered_at_step": 7
+        },
+        {
+          "rank": 0,
+          "planned_step": 47,
+          "incarnation": 1,
+          "delivered_at_step": 47
+        }
+      ],
+      "restarts": 2,
+      "seconds": 25.3,
+      "failures": []
+    },
+    {
+      "seed": 1005,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 51,
+          "incarnation": 0,
+          "delivered_at_step": 51
+        },
+        {
+          "rank": 1,
+          "planned_step": 58,
+          "incarnation": 1,
+          "delivered_at_step": 58
+        }
+      ],
+      "restarts": 2,
+      "seconds": 25.3,
+      "failures": []
+    },
+    {
+      "seed": 1006,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 4,
+          "incarnation": 0,
+          "delivered_at_step": 4
+        },
+        {
+          "rank": 0,
+          "planned_step": 15,
+          "incarnation": 1,
+          "delivered_at_step": 15
+        }
+      ],
+      "restarts": 2,
+      "seconds": 24.5,
+      "failures": []
+    },
+    {
+      "seed": 1007,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 52,
+          "incarnation": 0,
+          "delivered_at_step": 52
+        }
+      ],
+      "restarts": 1,
+      "seconds": 18.0,
+      "failures": []
+    },
+    {
+      "seed": 1008,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 6,
+          "incarnation": 0,
+          "delivered_at_step": 6
+        },
+        {
+          "rank": 0,
+          "planned_step": 22,
+          "incarnation": 1,
+          "delivered_at_step": 22
+        },
+        {
+          "rank": 0,
+          "planned_step": 29,
+          "incarnation": 2,
+          "delivered_at_step": 29
+        }
+      ],
+      "restarts": 3,
+      "seconds": 31.6,
+      "failures": []
+    },
+    {
+      "seed": 1009,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 1,
+          "incarnation": 0,
+          "delivered_at_step": 1
+        }
+      ],
+      "restarts": 1,
+      "seconds": 18.1,
+      "failures": []
+    },
+    {
+      "seed": 1010,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 39,
+          "incarnation": 0,
+          "delivered_at_step": 39
+        },
+        {
+          "rank": 0,
+          "planned_step": 53,
+          "incarnation": 1,
+          "delivered_at_step": 53
+        },
+        {
+          "rank": 1,
+          "planned_step": 55,
+          "incarnation": 2,
+          "delivered_at_step": 55
+        }
+      ],
+      "restarts": 3,
+      "seconds": 37.1,
+      "failures": []
+    },
+    {
+      "seed": 1011,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 2,
+          "incarnation": 0,
+          "delivered_at_step": 2
+        },
+        {
+          "rank": 0,
+          "planned_step": 17,
+          "incarnation": 1,
+          "delivered_at_step": 17
+        }
+      ],
+      "restarts": 2,
+      "seconds": 24.6,
+      "failures": []
+    },
+    {
+      "seed": 1012,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 10,
+          "incarnation": 0,
+          "delivered_at_step": 10
+        },
+        {
+          "rank": 0,
+          "planned_step": 11,
+          "incarnation": 1,
+          "delivered_at_step": 11
+        }
+      ],
+      "restarts": 2,
+      "seconds": 25.4,
+      "failures": []
+    },
+    {
+      "seed": 1013,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 17,
+          "incarnation": 0,
+          "delivered_at_step": 17
+        },
+        {
+          "rank": 0,
+          "planned_step": 49,
+          "incarnation": 1,
+          "delivered_at_step": 49
+        }
+      ],
+      "restarts": 2,
+      "seconds": 24.8,
+      "failures": []
+    },
+    {
+      "seed": 1014,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 1,
+          "incarnation": 0,
+          "delivered_at_step": 1
+        },
+        {
+          "rank": 1,
+          "planned_step": 16,
+          "incarnation": 1,
+          "delivered_at_step": 16
+        },
+        {
+          "rank": 1,
+          "planned_step": 17,
+          "incarnation": 2,
+          "delivered_at_step": 17
+        }
+      ],
+      "restarts": 3,
+      "seconds": 31.0,
+      "failures": []
+    },
+    {
+      "seed": 1015,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 49,
+          "incarnation": 0,
+          "delivered_at_step": 49
+        }
+      ],
+      "restarts": 1,
+      "seconds": 17.3,
+      "failures": []
+    },
+    {
+      "seed": 1016,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 25,
+          "incarnation": 0,
+          "delivered_at_step": 25
+        },
+        {
+          "rank": 0,
+          "planned_step": 47,
+          "incarnation": 1,
+          "delivered_at_step": 47
+        }
+      ],
+      "restarts": 2,
+      "seconds": 24.3,
+      "failures": []
+    },
+    {
+      "seed": 1017,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 41,
+          "incarnation": 0,
+          "delivered_at_step": 41
+        },
+        {
+          "rank": 0,
+          "planned_step": 59,
+          "incarnation": 1,
+          "delivered_at_step": 59
+        }
+      ],
+      "restarts": 2,
+      "seconds": 24.3,
+      "failures": []
+    },
+    {
+      "seed": 1018,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 42,
+          "incarnation": 0,
+          "delivered_at_step": 42
+        },
+        {
+          "rank": 0,
+          "planned_step": 50,
+          "incarnation": 1,
+          "delivered_at_step": 50
+        }
+      ],
+      "restarts": 2,
+      "seconds": 31.2,
+      "failures": []
+    },
+    {
+      "seed": 1019,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 22,
+          "incarnation": 0,
+          "delivered_at_step": 22
+        }
+      ],
+      "restarts": 1,
+      "seconds": 17.5,
+      "failures": []
+    },
+    {
+      "seed": 1020,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 2,
+          "incarnation": 0,
+          "delivered_at_step": 2
+        }
+      ],
+      "restarts": 1,
+      "seconds": 18.3,
+      "failures": []
+    },
+    {
+      "seed": 1021,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 12,
+          "incarnation": 0,
+          "delivered_at_step": 12
+        },
+        {
+          "rank": 1,
+          "planned_step": 33,
+          "incarnation": 1,
+          "delivered_at_step": 33
+        },
+        {
+          "rank": 1,
+          "planned_step": 37,
+          "incarnation": 2,
+          "delivered_at_step": 37
+        }
+      ],
+      "restarts": 3,
+      "seconds": 31.7,
+      "failures": []
+    },
+    {
+      "seed": 1022,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 27,
+          "incarnation": 0,
+          "delivered_at_step": 27
+        }
+      ],
+      "restarts": 1,
+      "seconds": 17.9,
+      "failures": []
+    },
+    {
+      "seed": 1023,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 29,
+          "incarnation": 0,
+          "delivered_at_step": 29
+        },
+        {
+          "rank": 0,
+          "planned_step": 46,
+          "incarnation": 1,
+          "delivered_at_step": 46
+        }
+      ],
+      "restarts": 2,
+      "seconds": 24.9,
+      "failures": []
+    },
+    {
+      "seed": 1024,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 31,
+          "incarnation": 0,
+          "delivered_at_step": 31
+        }
+      ],
+      "restarts": 1,
+      "seconds": 18.5,
+      "failures": []
+    },
+    {
+      "seed": 1025,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 4,
+          "incarnation": 0,
+          "delivered_at_step": 4
+        }
+      ],
+      "restarts": 1,
+      "seconds": 19.2,
+      "failures": []
+    },
+    {
+      "seed": 1026,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 31,
+          "incarnation": 0,
+          "delivered_at_step": 31
+        }
+      ],
+      "restarts": 1,
+      "seconds": 18.1,
+      "failures": []
+    },
+    {
+      "seed": 1027,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 8,
+          "incarnation": 0,
+          "delivered_at_step": 8
+        }
+      ],
+      "restarts": 1,
+      "seconds": 18.4,
+      "failures": []
+    },
+    {
+      "seed": 1028,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 26,
+          "incarnation": 0,
+          "delivered_at_step": 26
+        },
+        {
+          "rank": 0,
+          "planned_step": 39,
+          "incarnation": 1,
+          "delivered_at_step": 39
+        }
+      ],
+      "restarts": 2,
+      "seconds": 25.1,
+      "failures": []
+    },
+    {
+      "seed": 1029,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 20,
+          "incarnation": 0,
+          "delivered_at_step": 20
+        },
+        {
+          "rank": 1,
+          "planned_step": 40,
+          "incarnation": 1,
+          "delivered_at_step": 40
+        },
+        {
+          "rank": 1,
+          "planned_step": 45,
+          "incarnation": 2,
+          "delivered_at_step": 45
+        }
+      ],
+      "restarts": 3,
+      "seconds": 49.6,
+      "failures": []
+    },
+    {
+      "seed": 1030,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 28,
+          "incarnation": 0,
+          "delivered_at_step": 28
+        }
+      ],
+      "restarts": 1,
+      "seconds": 19.4,
+      "failures": []
+    },
+    {
+      "seed": 1031,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 3,
+          "incarnation": 0,
+          "delivered_at_step": 3
+        },
+        {
+          "rank": 1,
+          "planned_step": 36,
+          "incarnation": 1,
+          "delivered_at_step": 36
+        },
+        {
+          "rank": 1,
+          "planned_step": 37,
+          "incarnation": 2,
+          "delivered_at_step": 37
+        }
+      ],
+      "restarts": 3,
+      "seconds": 32.2,
+      "failures": []
+    },
+    {
+      "seed": 1032,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 35,
+          "incarnation": 0,
+          "delivered_at_step": 35
+        },
+        {
+          "rank": 0,
+          "planned_step": 42,
+          "incarnation": 1,
+          "delivered_at_step": 42
+        }
+      ],
+      "restarts": 2,
+      "seconds": 24.8,
+      "failures": []
+    },
+    {
+      "seed": 1033,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 14,
+          "incarnation": 0,
+          "delivered_at_step": 14
+        },
+        {
+          "rank": 0,
+          "planned_step": 18,
+          "incarnation": 1,
+          "delivered_at_step": 18
+        },
+        {
+          "rank": 0,
+          "planned_step": 47,
+          "incarnation": 2,
+          "delivered_at_step": 47
+        }
+      ],
+      "restarts": 3,
+      "seconds": 31.6,
+      "failures": []
+    },
+    {
+      "seed": 1034,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 41,
+          "incarnation": 0,
+          "delivered_at_step": 41
+        }
+      ],
+      "restarts": 1,
+      "seconds": 18.5,
+      "failures": []
+    },
+    {
+      "seed": 1035,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 29,
+          "incarnation": 0,
+          "delivered_at_step": 29
+        },
+        {
+          "rank": 1,
+          "planned_step": 51,
+          "incarnation": 1,
+          "delivered_at_step": 51
+        },
+        {
+          "rank": 0,
+          "planned_step": 57,
+          "incarnation": 2,
+          "delivered_at_step": 57
+        }
+      ],
+      "restarts": 3,
+      "seconds": 31.9,
+      "failures": []
+    },
+    {
+      "seed": 1036,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 45,
+          "incarnation": 0,
+          "delivered_at_step": 45
+        },
+        {
+          "rank": 0,
+          "planned_step": 47,
+          "incarnation": 1,
+          "delivered_at_step": 47
+        }
+      ],
+      "restarts": 2,
+      "seconds": 25.2,
+      "failures": []
+    },
+    {
+      "seed": 1037,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 29,
+          "incarnation": 0,
+          "delivered_at_step": 29
+        }
+      ],
+      "restarts": 1,
+      "seconds": 18.0,
+      "failures": []
+    },
+    {
+      "seed": 1038,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 1,
+          "planned_step": 5,
+          "incarnation": 0,
+          "delivered_at_step": 5
+        }
+      ],
+      "restarts": 1,
+      "seconds": 23.7,
+      "failures": []
+    },
+    {
+      "seed": 1039,
+      "passed": true,
+      "kills": [
+        {
+          "rank": 0,
+          "planned_step": 12,
+          "incarnation": 0,
+          "delivered_at_step": 12
+        },
+        {
+          "rank": 0,
+          "planned_step": 13,
+          "incarnation": 1,
+          "delivered_at_step": 13
+        },
+        {
+          "rank": 0,
+          "planned_step": 43,
+          "incarnation": 2,
+          "delivered_at_step": 43
+        }
+      ],
+      "restarts": 3,
+      "seconds": 31.6,
+      "failures": []
+    }
+  ]
+}

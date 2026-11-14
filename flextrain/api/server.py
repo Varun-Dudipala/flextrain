@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -30,7 +31,7 @@ def _pid_alive(pid: Any) -> Optional[bool]:
     return True
 
 
-def _with_liveness(record: Dict[str, Any], hostname: str) -> Dict[str, Any]:
+def with_liveness(record: Dict[str, Any], hostname: str) -> Dict[str, Any]:
     record = dict(record)
     age = time.time() - float(record.get("updated_at", 0))
     record["seconds_since_update"] = round(age, 1)
@@ -46,7 +47,7 @@ def _with_liveness(record: Dict[str, Any], hostname: str) -> Dict[str, Any]:
 
 def create_app(registry: Optional[RunRegistry] = None) -> FastAPI:
     registry = registry or RunRegistry()
-    hostname = os.uname().nodename if hasattr(os, "uname") else ""
+    hostname = socket.gethostname()  # the same call the trainer uses for the run record's "host"
     app = FastAPI(title="FlexTrain", version=__version__)
 
     @app.get("/", response_class=HTMLResponse)
@@ -59,7 +60,7 @@ def create_app(registry: Optional[RunRegistry] = None) -> FastAPI:
 
     @app.get("/api/jobs")
     def list_jobs(status: Optional[str] = Query(None, description="filter by status")) -> Dict[str, Any]:
-        jobs = [_with_liveness(r, hostname) for r in registry.list()]
+        jobs = [with_liveness(r, hostname) for r in registry.list()]
         counts: Dict[str, int] = {}
         for job in jobs:
             counts[job.get("status", "unknown")] = counts.get(job.get("status", "unknown"), 0) + 1
@@ -75,7 +76,7 @@ def create_app(registry: Optional[RunRegistry] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="invalid run id") from None
         if record is None:
             raise HTTPException(status_code=404, detail=f"run {run_id!r} not found")
-        return _with_liveness(record, hostname)
+        return with_liveness(record, hostname)
 
     @app.get("/api/jobs/{run_id}/metrics")
     def get_metrics(run_id: str, tail: Optional[int] = Query(None, ge=1, le=100_000)) -> Dict[str, List]:

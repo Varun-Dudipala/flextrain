@@ -3,19 +3,43 @@
 A backend stores opaque checkpoint blobs under string keys and can list them, which
 lets retention and resume work from what is *actually persisted* rather than from
 in-memory bookkeeping that is lost when a job restarts.
+
+Integrity. ``torch.load`` does not notice a flipped byte inside tensor data: the archive
+still parses and the weights are silently wrong. Every backend therefore writes a SHA-256
+digest of the serialized bytes next to the checkpoint (``<name>.sha256``, in the format
+``sha256sum -c`` / ``shasum -a 256 -c`` understand) and verifies it on load. The digest is
+written only after the checkpoint itself is durable, and a digest left over from an earlier
+checkpoint of the same name is removed *before* the new bytes replace the old ones. A crash in
+between therefore leaves a complete checkpoint with no digest - never one paired with a digest
+of different bytes. A checkpoint without a digest (or written before digests existed) loads
+unverified.
+
+Errors. ``load`` raises ``CheckpointCorruptedError`` when the stored bytes are wrong (digest
+mismatch, or they do not deserialize) and lets every other error - the file system or the
+network failing - propagate unchanged. Callers rely on that distinction: a corrupted checkpoint
+can be skipped, an unreachable one must not be mistaken for a missing one.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
+import pickle
 import posixpath
+import re
+import sys
 import tempfile
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, BinaryIO, Dict, List, Optional, Union
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
 
 import torch
 
@@ -23,9 +47,71 @@ logger = logging.getLogger(__name__)
 
 PathLike = Union[str, Path]
 
+DIGEST_SUFFIX = ".sha256"
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_HASH_CHUNK = 4 * 1024 * 1024
+
+
+class CheckpointCorruptedError(RuntimeError):
+    """The stored bytes of a checkpoint are wrong: they fail their digest or cannot be deserialized."""
+
+
+class UntrustedCheckpointError(RuntimeError):
+    """The checkpoint is intact but holds pickled Python objects that safe loading refuses to build."""
+
+
+def _deserialize(stream: BinaryIO, path: PathLike, allow_pickle: bool = False) -> Dict[str, Any]:
+    """Turn checkpoint bytes into a state dict.
+
+    Unpickling can run arbitrary code, and a checkpoint directory is writable by more parties
+    than the training code is (a shared bucket, a shared file system). So by default only
+    tensors and plain containers are reconstructed (``torch.load(weights_only=True)``), which is
+    all a FlexTrain checkpoint contains. The digest does not change this: it sits next to the
+    data, so it shows the bytes are what was written, not who wrote them.
+    """
+    try:
+        return torch.load(stream, map_location="cpu", weights_only=not allow_pickle)
+    except pickle.UnpicklingError as e:
+        # torch words the refusal differently across versions ("Unsupported class X" in 2.3,
+        # "Unsupported global: GLOBAL X was not an allowed global" later).
+        refused = ("Unsupported global", "Unsupported class", "allowed global")
+        if not allow_pickle and any(marker in str(e) for marker in refused):
+            raise UntrustedCheckpointError(
+                f"{path} contains pickled Python objects, which are not loaded by default because unpickling "
+                f"can execute code. (FlexTrain <= 0.2 checkpoints do; so do checkpoints holding custom scheduler "
+                f"or optimizer state.) If you trust where this file came from, set checkpoint.allow_pickle=true."
+            ) from e
+        raise CheckpointCorruptedError(f"{path} is not a readable checkpoint: {type(e).__name__}: {e}") from e
+    except (OSError, MemoryError):
+        raise  # the machine's problem, not the checkpoint's
+    except Exception as e:
+        # The bytes were read; they just are not a checkpoint (truncated archive, damaged pickle
+        # stream). Unpicklers signal that with whatever exception the damage happens to trigger.
+        raise CheckpointCorruptedError(f"{path} is not a readable checkpoint: {type(e).__name__}: {e}") from e
+
+
+def digest_path(path: PathLike) -> str:
+    """Where the digest of the checkpoint at ``path`` is stored."""
+    return f"{path}{DIGEST_SUFFIX}"
+
+
+def _hash_stream(stream: BinaryIO) -> str:
+    """SHA-256 of ``stream`` from its current position to the end (hashlib releases the GIL)."""
+    sha = hashlib.sha256()
+    buffer = bytearray(_HASH_CHUNK)
+    view = memoryview(buffer)
+    while True:
+        n = stream.readinto(view)
+        if not n:
+            return sha.hexdigest()
+        sha.update(view[:n])
+
 
 class StorageBackend(ABC):
     """Abstract checkpoint store."""
+
+    checksum: bool = True
+    allow_pickle: bool = False
 
     @abstractmethod
     def save(self, state: Dict[str, Any], path: PathLike) -> int:
@@ -33,7 +119,7 @@ class StorageBackend(ABC):
 
     @abstractmethod
     def load(self, path: PathLike) -> Dict[str, Any]:
-        ...
+        """Load a checkpoint, raising ``CheckpointCorruptedError`` if its digest does not match."""
 
     @abstractmethod
     def exists(self, path: PathLike) -> bool:
@@ -47,11 +133,70 @@ class StorageBackend(ABC):
     def list(self, directory: PathLike) -> List[str]:
         """Return the full paths of the entries directly inside ``directory``."""
 
-    def size(self, path: PathLike) -> Optional[int]:
-        return None
+    @abstractmethod
+    def write_bytes(self, path: PathLike, data: bytes) -> None:
+        """Store a small blob atomically."""
+
+    @abstractmethod
+    def read_bytes(self, path: PathLike) -> Optional[bytes]:
+        """Return a small blob, or ``None`` if it does not exist."""
 
     def join(self, directory: PathLike, name: str) -> str:
         return posixpath.join(str(directory), name)
+
+    # ------------------------------------------------------------------ integrity
+    def write_digest(self, path: PathLike, digest: str) -> None:
+        name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
+        self.write_bytes(digest_path(path), f"{digest}  {name}\n".encode())
+
+    def read_digest(self, path: PathLike) -> Optional[str]:
+        """The recorded SHA-256 of the checkpoint at ``path``; ``None`` if none was recorded."""
+        data = self.read_bytes(digest_path(path))
+        if data is None:
+            return None
+        fields = data.split()
+        digest = fields[0].decode("ascii", "replace") if fields else ""
+        if not _DIGEST_RE.match(digest):
+            raise CheckpointCorruptedError(f"unreadable digest file {digest_path(path)}")
+        return digest
+
+    def _verify(self, path: PathLike, stream: BinaryIO) -> None:
+        """Check ``stream`` (positioned at 0) against the recorded digest, then rewind it."""
+        expected = self.read_digest(path) if self.checksum else None
+        if expected is None:
+            return
+        actual = _hash_stream(stream)
+        if actual != expected:
+            raise CheckpointCorruptedError(
+                f"checksum mismatch for {path}: stored bytes hash to {actual[:12]}..., "
+                f"expected {expected[:12]}... (bit rot, or a truncated / partial copy)"
+            )
+        stream.seek(0)
+
+    def delete_digest(self, path: PathLike) -> None:
+        if self.exists(digest_path(path)):
+            self.delete(digest_path(path))
+
+    def delete_checkpoint(self, path: PathLike) -> None:
+        """Delete a checkpoint and its digest (digest first, so no orphaned digest can remain)."""
+        self.delete_digest(path)
+        self.delete(path)
+
+
+def _sync(fd: int) -> None:
+    """Flush ``fd`` to stable storage.
+
+    On macOS ``fsync`` only hands the data to the drive, which may still hold it in a volatile
+    cache; ``F_FULLFSYNC`` is what asks the drive to flush. Without it "survives power loss"
+    would be true on Linux only.
+    """
+    if sys.platform == "darwin":
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except OSError:  # not supported by this file system: fall back to a plain fsync
+            pass
+    os.fsync(fd)
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -60,7 +205,7 @@ def _fsync_dir(directory: Path) -> None:
         return
     fd = os.open(directory, os.O_RDONLY)
     try:
-        os.fsync(fd)
+        _sync(fd)
     finally:
         os.close(fd)
 
@@ -74,35 +219,47 @@ class LocalStorage(StorageBackend):
     even if the node loses power mid-write.
     """
 
-    def __init__(self, fsync: bool = True):
+    def __init__(self, fsync: bool = True, checksum: bool = True, allow_pickle: bool = False):
         self.fsync = fsync
+        self.checksum = checksum
+        self.allow_pickle = allow_pickle
+
+    def _replace_into(self, tmp_path: Path, path: Path) -> None:
+        os.replace(tmp_path, path)
+        if self.fsync:
+            _fsync_dir(path.parent)
 
     def save(self, state: Dict[str, Any], path: PathLike) -> int:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+        digest = None
         try:
-            with open(tmp_path, "wb") as f:
+            with open(tmp_path, "w+b") as f:
                 torch.save(state, f)
                 f.flush()
-                if self.fsync:
-                    os.fsync(f.fileno())
                 nbytes = f.tell()
-            os.replace(tmp_path, path)
-            if self.fsync:
-                _fsync_dir(path.parent)
-            return nbytes
+                if self.checksum:
+                    f.seek(0)
+                    digest = _hash_stream(f)  # read back through the page cache
+                if self.fsync:
+                    _sync(f.fileno())
+            self.delete_digest(path)  # never let an older digest describe the new bytes
+            self._replace_into(tmp_path, path)
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
+        if digest is not None:
+            self.write_digest(path, digest)
+        return nbytes
 
     def load(self, path: PathLike) -> Dict[str, Any]:
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
-        # weights_only=False: checkpoints also carry Python RNG state and metadata.
-        # Only load checkpoints you (or your job) wrote.
-        return torch.load(path, map_location="cpu", weights_only=False)
+        with open(path, "rb") as f:
+            self._verify(path, f)
+            return _deserialize(f, path, self.allow_pickle)
 
     def exists(self, path: PathLike) -> bool:
         return Path(path).exists()
@@ -116,9 +273,24 @@ class LocalStorage(StorageBackend):
             return []
         return [str(p) for p in directory.iterdir() if p.is_file()]
 
-    def size(self, path: PathLike) -> Optional[int]:
+    def write_bytes(self, path: PathLike, data: bytes) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
         try:
-            return Path(path).stat().st_size
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+                f.flush()
+                if self.fsync:
+                    _sync(f.fileno())
+            self._replace_into(tmp_path, path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+    def read_bytes(self, path: PathLike) -> Optional[bytes]:
+        try:
+            return Path(path).read_bytes()
         except FileNotFoundError:
             return None
 
@@ -147,10 +319,48 @@ def _key(path: PathLike) -> str:
     return str(path).replace("\\", "/").lstrip("/")
 
 
-class GCSStorage(StorageBackend):
-    """Google Cloud Storage backend. A single-object upload is atomic in GCS."""
+class _ObjectStorage(StorageBackend):
+    """Shared save / load logic for object stores (a single-object upload is atomic)."""
 
-    def __init__(self, bucket_name: str, credentials_path: Optional[str] = None, client: Any = None):
+    def __init__(self, checksum: bool = True, allow_pickle: bool = False):
+        self.checksum = checksum
+        self.allow_pickle = allow_pickle
+
+    @abstractmethod
+    def _upload(self, spool: BinaryIO, path: PathLike, nbytes: int) -> None:
+        ...
+
+    @abstractmethod
+    def _download(self, path: PathLike, buffer: BinaryIO) -> None:
+        ...
+
+    def save(self, state: Dict[str, Any], path: PathLike) -> int:
+        with _serialize(state) as spool:
+            nbytes = os.fstat(spool.fileno()).st_size
+            digest = None
+            if self.checksum:
+                digest = _hash_stream(spool)
+                spool.seek(0)
+            self.delete_digest(path)  # never let an older digest describe the new bytes
+            self._upload(spool, path, nbytes)
+        if digest is not None:
+            self.write_digest(path, digest)
+        return nbytes
+
+    def load(self, path: PathLike) -> Dict[str, Any]:
+        buffer = io.BytesIO()
+        self._download(path, buffer)
+        buffer.seek(0)
+        self._verify(path, buffer)
+        return _deserialize(buffer, path, self.allow_pickle)
+
+
+class GCSStorage(_ObjectStorage):
+    """Google Cloud Storage backend."""
+
+    def __init__(self, bucket_name: str, credentials_path: Optional[str] = None, client: Any = None,
+                 checksum: bool = True, allow_pickle: bool = False):
+        super().__init__(checksum, allow_pickle)
         if client is None:
             try:
                 from google.cloud import storage
@@ -161,33 +371,38 @@ class GCSStorage(StorageBackend):
         self.client = client
         self.bucket = client.bucket(bucket_name)
 
-    def save(self, state: Dict[str, Any], path: PathLike) -> int:
-        with _serialize(state) as spool:
-            nbytes = os.fstat(spool.fileno()).st_size
-            self.bucket.blob(_key(path)).upload_from_file(spool, size=nbytes)
-        return nbytes
+    def _upload(self, spool: BinaryIO, path: PathLike, nbytes: int) -> None:
+        self.bucket.blob(_key(path)).upload_from_file(spool, size=nbytes)
 
-    def load(self, path: PathLike) -> Dict[str, Any]:
-        buffer = io.BytesIO()
+    def _download(self, path: PathLike, buffer: BinaryIO) -> None:
         self.bucket.blob(_key(path)).download_to_file(buffer)
-        buffer.seek(0)
-        return torch.load(buffer, map_location="cpu", weights_only=False)
 
     def exists(self, path: PathLike) -> bool:
         return self.bucket.blob(_key(path)).exists()
 
     def delete(self, path: PathLike) -> None:
-        self.bucket.blob(_key(path)).delete()
+        blob = self.bucket.blob(_key(path))
+        if blob.exists():  # deleting a missing object is an error in GCS; make it idempotent
+            blob.delete()
 
     def list(self, directory: PathLike) -> List[str]:
         prefix = _key(directory).rstrip("/") + "/"
         return [b.name for b in self.client.list_blobs(self.bucket, prefix=prefix, delimiter="/")]
 
+    def write_bytes(self, path: PathLike, data: bytes) -> None:
+        self.bucket.blob(_key(path)).upload_from_string(data)
 
-class S3Storage(StorageBackend):
-    """Amazon S3 backend. A single PUT / multipart upload is atomic in S3."""
+    def read_bytes(self, path: PathLike) -> Optional[bytes]:
+        blob = self.bucket.blob(_key(path))
+        return blob.download_as_bytes() if blob.exists() else None
 
-    def __init__(self, bucket_name: str, region: Optional[str] = None, client: Any = None):
+
+class S3Storage(_ObjectStorage):
+    """Amazon S3 backend."""
+
+    def __init__(self, bucket_name: str, region: Optional[str] = None, client: Any = None, checksum: bool = True,
+                 allow_pickle: bool = False):
+        super().__init__(checksum, allow_pickle)
         if client is None:
             try:
                 import boto3
@@ -197,17 +412,11 @@ class S3Storage(StorageBackend):
         self.bucket_name = bucket_name
         self.s3 = client
 
-    def save(self, state: Dict[str, Any], path: PathLike) -> int:
-        with _serialize(state) as spool:
-            nbytes = os.fstat(spool.fileno()).st_size
-            self.s3.upload_fileobj(spool, self.bucket_name, _key(path))
-        return nbytes
+    def _upload(self, spool: BinaryIO, path: PathLike, nbytes: int) -> None:
+        self.s3.upload_fileobj(spool, self.bucket_name, _key(path))
 
-    def load(self, path: PathLike) -> Dict[str, Any]:
-        buffer = io.BytesIO()
+    def _download(self, path: PathLike, buffer: BinaryIO) -> None:
         self.s3.download_fileobj(self.bucket_name, _key(path), buffer)
-        buffer.seek(0)
-        return torch.load(buffer, map_location="cpu", weights_only=False)
 
     def exists(self, path: PathLike) -> bool:
         try:
@@ -229,6 +438,14 @@ class S3Storage(StorageBackend):
         for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix, Delimiter="/"):
             keys.extend(obj["Key"] for obj in page.get("Contents", []))
         return keys
+
+    def write_bytes(self, path: PathLike, data: bytes) -> None:
+        self.s3.put_object(Bucket=self.bucket_name, Key=_key(path), Body=data)
+
+    def read_bytes(self, path: PathLike) -> Optional[bytes]:
+        if not self.exists(path):
+            return None
+        return self.s3.get_object(Bucket=self.bucket_name, Key=_key(path))["Body"].read()
 
 
 def create_storage_backend(backend_type: str, bucket_name: Optional[str] = None, **kwargs) -> StorageBackend:

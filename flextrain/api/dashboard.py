@@ -66,10 +66,11 @@ async function refresh() {
       `<div class="tile"><small>${k}</small><b class="${k}">${counts[k] || 0}</b></div>`).join("");
     const rows = data.jobs.map(j => {
       const status = j.stale ? "stale" : j.status;
-      const ckpt = j.last_checkpoint_step != null ? `step ${j.last_checkpoint_step}` : "–";
+      const cls = ["running", "completed", "preempted", "failed", "stale"].includes(status) ? status : "";
+      const ckpt = j.last_checkpoint_step != null ? `step ${esc(j.last_checkpoint_step)}` : "–";
       return `<tr data-id="${esc(j.run_id)}" class="${j.run_id === selected ? "sel" : ""}">
-        <td>${esc(j.run_id)}</td><td><span class="pill ${status}">${esc(status)}</span></td>
-        <td class="num">${fmt(j.step, 0)}${j.max_steps ? " / " + j.max_steps : ""}</td><td class="num">${fmt(j.epoch, 0)}</td>
+        <td>${esc(j.run_id)}</td><td><span class="pill ${cls}">${esc(status)}</span></td>
+        <td class="num">${fmt(j.step, 0)}${j.max_steps ? " / " + esc(j.max_steps) : ""}</td><td class="num">${fmt(j.epoch, 0)}</td>
         <td class="num">${fmt(j.loss)}</td><td class="num">${fmt(j.samples_per_s, 1)}</td>
         <td class="num">${fmt(j.world_size, 0)}</td><td class="num">${fmt(j.restart_count, 0)}</td>
         <td>${ckpt}</td><td>${ago(j.seconds_since_update)}</td></tr>`;

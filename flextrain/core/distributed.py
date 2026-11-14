@@ -97,21 +97,27 @@ def init_distributed(config: Optional[DistributedConfig] = None) -> DistContext:
 
 
 def _elastic_attempt_store(rank: int, world_size: int, timeout: timedelta) -> Optional[dist.Store]:
-    """Rendezvous store namespaced by restart attempt when running under torchelastic.
+    """Per-attempt namespace on the agent's store - a fallback for jobs started with bare torchrun.
 
-    The elastic agent's TCPStore outlives the worker group. Without a per-attempt namespace a
-    restarted rank can read the address its peer published in the *previous* attempt (the
-    peer has not overwritten it yet), connect to a dead port, and hang until the timeout.
-    Some torch versions add this prefix themselves; doing it here makes restarts reliable
-    regardless of version.
+    When the elastic agent hosts one TCPStore for the whole job (``TORCHELASTIC_USE_AGENT_STORE``)
+    that store outlives every worker group. A restarted rank can then read the address its peer
+    published in the *previous* attempt, connect to a dead port and hang until the timeout, so
+    each attempt gets its own key prefix.
+
+    The prefix is the agent's restart count, which is the only attempt number workers are given
+    - and each node's agent keeps its own (it only counts failures of its own workers, and a
+    replaced node starts again at 0). On one node that is exact. Across nodes the counters can
+    disagree, and ranks would then wait for each other under different prefixes. ``flextrain
+    launch`` therefore avoids the shared store altogether (it sets
+    ``TORCH_DISABLE_SHARE_RDZV_TCP_STORE=1``, so every attempt gets a fresh store on a fresh port
+    and no namespace is needed), and this function returns ``None`` whenever the store is not the
+    agent's.
     """
     attempt = os.environ.get("TORCHELASTIC_RESTART_COUNT")
     addr, port = os.environ.get("MASTER_ADDR"), os.environ.get("MASTER_PORT")
-    if attempt is None or not addr or not port:
+    if os.environ.get("TORCHELASTIC_USE_AGENT_STORE") != "True" or attempt is None or not addr or not port:
         return None
-    agent_hosts_store = os.environ.get("TORCHELASTIC_USE_AGENT_STORE") == "True"
-    store = dist.TCPStore(addr, int(port), world_size, is_master=(not agent_hosts_store and rank == 0),
-                          timeout=timeout, multi_tenant=True)
+    store = dist.TCPStore(addr, int(port), world_size, is_master=False, timeout=timeout, multi_tenant=True)
     return dist.PrefixStore(f"flextrain/attempt_{attempt}", store)
 
 
@@ -122,11 +128,6 @@ def destroy_distributed() -> None:
 
 def is_dist() -> bool:
     return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
-
-
-def barrier() -> None:
-    if is_dist():
-        dist.barrier()
 
 
 def _collective_device() -> torch.device:

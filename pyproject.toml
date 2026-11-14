@@ -25,7 +25,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.3",
+    "torch>=2.5",  # lowest version the full suite passes on (see the min-torch CI job)
     "pyyaml>=6.0",
     "typer>=0.9.0",
     "rich>=13.0.0",

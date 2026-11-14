@@ -7,6 +7,7 @@ Behaviour is controlled by environment variables so the tests can inject failure
   FT_CRASH_AT_STEP     raise on rank FT_CRASH_RANK after this optimizer step ...
   FT_CRASH_RANK        ... (default 1) - only in the first incarnation (restart count 0)
   FT_STEP_SLEEP        seconds to sleep per step (gives the tests time to send signals)
+  FT_FAIL_SAVE_AT_STEP rank 0's storage refuses to write checkpoints from this step on
 """
 
 from __future__ import annotations
@@ -64,6 +65,17 @@ class InstrumentedTrainer(Trainer):
         self.crash_at = int(os.environ.get("FT_CRASH_AT_STEP", "0"))
         self.crash_rank = int(os.environ.get("FT_CRASH_RANK", "1"))
         self.step_sleep = float(os.environ.get("FT_STEP_SLEEP", "0"))
+        fail_save_at = int(os.environ.get("FT_FAIL_SAVE_AT_STEP", "0"))
+        if fail_save_at and self.is_main_process:
+            storage = self.checkpoint_manager.storage
+            real_save = storage.save
+
+            def failing_save(state, path):
+                if state["step"] >= fail_save_at:
+                    raise OSError("injected failure: no space left on device")
+                return real_save(state, path)
+
+            storage.save = failing_save
         self.sample_log = open(out_dir / f"samples_rank{self.rank}.jsonl", "a")
         (out_dir / f"pid_rank{self.rank}").write_text(str(os.getpid()))
 

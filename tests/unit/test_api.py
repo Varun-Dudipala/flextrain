@@ -21,6 +21,13 @@ def client(registry):
     return TestClient(create_app(registry))
 
 
+def test_dashboard_escapes_every_field_it_takes_from_a_run_record(client):
+    """Run records are files anyone who can write the registry controls; the page must not trust them."""
+    page = client.get("/").text
+    assert 'class="pill ${cls}"' in page and '"pill ${status}"' not in page  # class from a fixed list only
+    assert "esc(j.max_steps)" in page and "esc(j.last_checkpoint_step)" in page
+
+
 def test_health(client):
     assert client.get("/api/health").json() == {"status": "healthy", "version": __version__}
 
