@@ -250,7 +250,18 @@ class TestRestartNamespace:
 
         import torch.distributed as dist
 
-        server = dist.TCPStore("127.0.0.1", 0, 1, is_master=True, timeout=timedelta(seconds=10), multi_tenant=True)
+        # Starting the store means connecting to it over loopback. On GitHub's macOS runner the
+        # first such connection in the process has timed out while the ones after it were
+        # immediate, so a slow start is retried rather than reported as a failure of the tests
+        # below, which are about what is read from a store that is already up.
+        for tries_left in (2, 1, 0):
+            try:
+                server = dist.TCPStore("127.0.0.1", 0, 1, is_master=True, timeout=timedelta(seconds=20),
+                                       multi_tenant=True)
+                break
+            except dist.DistNetworkError:
+                if not tries_left:
+                    raise
         monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
         monkeypatch.setenv("MASTER_PORT", str(server.port))
         monkeypatch.setenv("TORCHELASTIC_USE_AGENT_STORE", "True")

@@ -48,6 +48,7 @@ jobs:
       - name: Unit tests
         run: pytest -m "not integration" -q --cov=flextrain --cov-report=term-missing:skip-covered
       - name: Multi-process integration tests (torchrun, gloo)
+        if: ${{ !cancelled() }}  # a unit failure must not hide whether the multi-process tests pass
         run: pytest -m integration -q
 
   min-torch:
