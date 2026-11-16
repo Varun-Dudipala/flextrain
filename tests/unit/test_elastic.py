@@ -250,10 +250,11 @@ class TestRestartNamespace:
 
         import torch.distributed as dist
 
-        # Starting the store means connecting to it over loopback. On GitHub's macOS runner the
-        # first such connection in the process has timed out while the ones after it were
-        # immediate, so a slow start is retried rather than reported as a failure of the tests
-        # below, which are about what is read from a store that is already up.
+        # TCPStore looks up the name of the address it connects to. On GitHub's macOS runner that
+        # reverse lookup of 127.0.0.1 takes 35 s (measured), longer than the timeout, and is
+        # immediate once the system has cached it. A slow start is therefore retried rather than
+        # reported as a failure of the tests below, which are about what is read from a store
+        # that is already up.
         for tries_left in (2, 1, 0):
             try:
                 server = dist.TCPStore("127.0.0.1", 0, 1, is_master=True, timeout=timedelta(seconds=20),

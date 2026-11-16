@@ -255,8 +255,10 @@ toy MLP used by the integration tests); raw per-trial data in
 [`results/chaos_macos_arm64.json`](results/chaos_macos_arm64.json). It says nothing yet about
 GPUs, NCCL, FSDP or more than one node. The harness was checked against deliberately broken
 builds: with resume disabled, and with checkpoints that omit optimizer state, it fails. Three
-fixed-seed trials run in CI (`tests/integration/test_chaos.py`); reproduce a campaign with
-`make chaos`.
+fixed-seed trials run in CI on Linux (`tests/integration/test_chaos.py`); reproduce a campaign
+with `make chaos`. CI runs the multi-process tests on Linux only: GitHub's macOS runner takes
+35 s for each reverse lookup of a loopback address, which PyTorch does in every process, so the
+macOS job runs the unit tests and the multi-process results on macOS are the local ones above.
 
 It also found a bug: a job killed before its first checkpoint restarted under a new run name and
 left the old registry record at `running` forever. All incarnations of a launch now share one
