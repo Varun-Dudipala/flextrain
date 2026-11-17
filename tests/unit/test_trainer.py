@@ -463,6 +463,244 @@ class TestDivergenceGuard:
             trainer.train()
 
 
+class IndexedRegression(RegressionDataset):
+    def __getitem__(self, i: int):
+        item = super().__getitem__(i)
+        item["idx"] = torch.tensor(i)
+        return item
+
+
+class BadSamples(nn.Module):
+    """A TinyModel whose loss is NaN for any micro-batch that contains one of ``bad`` sample indices."""
+
+    def __init__(self, bad=()):
+        super().__init__()
+        self.net = TinyModel()
+        self.bad = set(bad)
+        self.seen = []  # the sample indices of every micro-batch, in the order they were trained on
+
+    def forward(self, x, y, idx):
+        out, loss = self.net(x, y)
+        batch = idx.tolist()
+        self.seen.append(batch)
+        return out, loss * float("nan") if self.bad.intersection(batch) else loss
+
+
+def samples_of_steps(first, last, n=512, seed=42, per_step=8):
+    """The samples epoch 0 serves in optimizer steps ``first..last`` (1-based) of an undisturbed run."""
+    perm = torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
+    return perm[(first - 1) * per_step: last * per_step]
+
+
+class TestDivergenceRollback:
+    """Persistent divergence: go back to a healthy checkpoint, skip the data that led there, carry on.
+
+    Every run here checkpoints every 5 steps and gives up on a streak after 2 skipped steps, and
+    (unless said otherwise) steps 8-10 of the data are bad: 8 and 9 are skipped, 10 trips the
+    guard, the newest checkpoint before step 8 is step 5.
+    """
+
+    def make(self, make_config, tag, bad, trainer_cls=Trainer, steps=20, **sections):
+        ft = {"max_consecutive_nonfinite": 2, **sections.pop("fault_tolerance", {})}
+        cfg = make_config(steps, fault_tolerance=ft, **sections)
+        cfg.main.output_dir += f"-{tag}"
+        assert cfg.main.seed == 42, "samples_of_steps assumes the default seed"
+        torch.manual_seed(0)
+        return trainer_cls(BadSamples(bad), cfg, IndexedRegression(512)), cfg
+
+    def test_rolls_back_skips_the_bad_stretch_and_completes(self, make_config):
+        trainer, cfg = self.make(make_config, "a", samples_of_steps(8, 10))
+        result = trainer.train()
+
+        assert result.status == "completed" and result.global_step == 20
+        assert all(torch.isfinite(p).all() for p in trainer.model.parameters())
+        assert trainer.nonfinite_guard.total_skipped == 3  # steps 8 and 9, and the refused step 10
+        (record,) = trainer.rollbacks
+        assert (record["diverged_at_step"], record["rolled_back_to_step"]) == (10, 5)
+        assert record["skipped_data_from"] == {"epoch": 0, "consumed": 40}
+        assert record["skipped_data_to"] == {"epoch": 0, "consumed": 80}
+
+        # Twenty micro-batches were trained on before the guard gave up (steps 1-10, two each).
+        after = [i for batch in trainer.model.seen[20:] for i in batch]
+        assert after[:8] == samples_of_steps(11, 11), "training must continue right after the failed step"
+        assert not set(after) & set(samples_of_steps(6, 10)), "neither replayed nor bad data may come back"
+
+        run_record = trainer.registry.get(trainer.run_id)
+        assert run_record["status"] == "completed" and run_record["rollbacks"] == 1
+        assert run_record["last_rollback"]["rolled_back_to_step"] == 5
+        events = [json.loads(line) for line in Path(run_record["metrics_path"]).read_text().splitlines()]
+        assert [e["rolled_back_to_step"] for e in events if e.get("event") == "rollback"] == [5]
+
+    def test_result_is_exactly_a_run_that_never_saw_the_skipped_data(self, make_config):
+        """The rollback leaves nothing of the abandoned steps behind: not in the weights, the
+        optimizer, the schedule or the RNG streams."""
+        from flextrain.checkpoint import LocalStorage
+
+        rolled, _ = self.make(make_config, "rolled", samples_of_steps(8, 10))
+        rolled.train()
+
+        # Reference: clean data, stopped after step 5, then told to continue at sample 80.
+        crashed, cfg = self.make(make_config, "ref", (), trainer_cls=CrashAt)
+        crashed.crash_step = 5
+        with pytest.raises(RuntimeError, match="simulated node failure"):
+            crashed.train()
+        crashed.checkpoint_manager.close(raise_errors=False)
+        path = str(Path(cfg.resolved_checkpoint_dir()) / "checkpoint_step00000005.pt")
+        storage = LocalStorage()
+        state = storage.load(path)
+        assert state["trainer"]["sampler"]["consumed"] == 40
+        state["trainer"]["sampler"]["consumed"] = 80
+        storage.save(state, path)
+        torch.manual_seed(1234)
+        reference = Trainer(BadSamples(), cfg.copy(), IndexedRegression(512))
+        reference.train()
+
+        assert reference.global_step == rolled.global_step == 20
+        assert params_equal(rolled.model, reference.model)
+
+    def test_a_restart_right_after_a_rollback_neither_repeats_it_nor_replays_the_data(self, make_config):
+        """The rollback is durable before training continues: the lineage no longer offers the
+        abandoned checkpoints, and the checkpoint it leaves carries the new data position."""
+        class CrashAfterRollback(Trainer):
+            def _after_step(self):
+                stop = super()._after_step()
+                if self.rollbacks and self.global_step == 7:
+                    raise RuntimeError("simulated node failure")
+                return stop
+
+        bad = samples_of_steps(8, 10)
+        straight, _ = self.make(make_config, "straight", bad)
+        straight.train()
+
+        crashed, cfg = self.make(make_config, "crashed", bad, trainer_cls=CrashAfterRollback)
+        with pytest.raises(RuntimeError, match="simulated node failure"):
+            crashed.train()
+        crashed.checkpoint_manager.close(raise_errors=False)
+
+        torch.manual_seed(1234)
+        resumed = Trainer(BadSamples(bad), cfg.copy(), IndexedRegression(512))
+        result = resumed.train()
+        assert Path(resumed.resumed_from).name == "checkpoint_step00000005.pt"
+        assert result.status == "completed" and len(resumed.rollbacks) == 1
+        assert resumed.model.seen[0] + resumed.model.seen[1] == samples_of_steps(11, 11)
+        assert not {i for batch in resumed.model.seen for i in batch} & set(samples_of_steps(6, 10))
+        assert params_equal(straight.model, resumed.model)
+
+    def test_checkpoints_written_after_the_weights_blew_up_are_not_rolled_back_to(self, make_config):
+        """Weights can turn to NaN one step before any gradient does, and a checkpoint taken in
+        between loads without complaint."""
+        class PoisonWeights(Trainer):
+            poisoned = False
+
+            def _optimizer_step(self):
+                out = super()._optimizer_step()
+                if self.global_step + 1 == 6 and not self.poisoned:
+                    self.poisoned = True
+                    with torch.no_grad():
+                        next(self.model.parameters()).fill_(float("nan"))
+                return out
+
+        trainer, cfg = self.make(make_config, "poison", (), trainer_cls=PoisonWeights,
+                                 checkpoint={"save_interval_steps": 2})
+        result = trainer.train()
+        # Steps 7 and 8 are skipped and step 9 trips the guard, so the last good step is 6 - but
+        # the checkpoint of step 6 already holds the NaN weights. Step 4 is the one to take.
+        (record,) = trainer.rollbacks
+        assert (record["diverged_at_step"], record["rolled_back_to_step"]) == (9, 4)
+        assert result.status == "completed" and result.global_step == 20
+        assert all(torch.isfinite(p).all() for p in trainer.model.parameters())
+
+    def test_a_restart_after_a_rollback_does_not_resume_from_an_abandoned_checkpoint(self, make_config):
+        """Same failure as above, then the job dies one step after rolling back. The checkpoints of
+        steps 6 and 8 are still on disk, are newer than step 4, and hold NaN weights."""
+        class PoisonThenCrash(Trainer):
+            poisoned = False
+
+            def _optimizer_step(self):
+                out = super()._optimizer_step()
+                if self.global_step + 1 == 6 and not self.poisoned:
+                    self.poisoned = True
+                    with torch.no_grad():
+                        next(self.model.parameters()).fill_(float("nan"))
+                return out
+
+            def _after_step(self):
+                stop = super()._after_step()
+                if self.rollbacks and self.global_step == 5:
+                    raise RuntimeError("simulated node failure")
+                return stop
+
+        crashed, cfg = self.make(make_config, "abandoned", (), trainer_cls=PoisonThenCrash,
+                                 checkpoint={"save_interval_steps": 2})
+        with pytest.raises(RuntimeError, match="simulated node failure"):
+            crashed.train()
+        crashed.checkpoint_manager.close(raise_errors=False)
+        assert "checkpoint_step00000008.pt" in checkpoint_files(cfg)
+
+        torch.manual_seed(1234)
+        resumed = Trainer(BadSamples(), cfg.copy(), IndexedRegression(512))
+        result = resumed.train()
+        assert Path(resumed.resumed_from).name == "checkpoint_step00000004.pt"
+        assert result.status == "completed" and len(resumed.rollbacks) == 1
+        assert all(torch.isfinite(p).all() for p in resumed.model.parameters())
+
+    def test_gives_up_after_max_rollbacks_in_a_row_and_a_restart_does_not_start_over(self, make_config):
+        bad = samples_of_steps(8, 64)  # everything from step 8 on
+        trainer, cfg = self.make(make_config, "hopeless", bad)
+        with pytest.raises(TrainingDivergedError, match=r"giving up after 2 rollback\(s\) in a row"):
+            trainer.train()
+        assert len(trainer.rollbacks) == 2
+        assert trainer.registry.get(trainer.run_id)["status"] == "failed"
+        trainer.checkpoint_manager.close(raise_errors=False)
+
+        # What the elastic agent does next: restart. The budget is in the checkpoint, not in memory.
+        torch.manual_seed(0)
+        restarted = Trainer(BadSamples(bad), cfg.copy(), IndexedRegression(512))
+        with pytest.raises(TrainingDivergedError, match="giving up after 2"):
+            restarted.train()
+        assert len(restarted.rollbacks) == 2
+
+    def test_a_later_divergence_gets_a_rollback_of_its_own(self, make_config):
+        """The limit is on rollbacks in a row. After the first one, optimizer step g trains on the
+        data of step g+5, so the second bad stretch (data of steps 20-22) arrives at steps 15-17:
+        well past step 10, where the run diverged before."""
+        bad = samples_of_steps(8, 10) + samples_of_steps(20, 22)
+        trainer, _ = self.make(make_config, "twice", bad, fault_tolerance={"max_rollbacks": 1})
+        result = trainer.train()
+        assert result.status == "completed" and result.global_step == 20
+        assert [(r["diverged_at_step"], r["rolled_back_to_step"]) for r in trainer.rollbacks] == [(10, 5), (17, 10)]
+
+    def test_without_a_healthy_checkpoint_the_run_fails_as_before(self, make_config):
+        trainer, _ = self.make(make_config, "early", samples_of_steps(3, 64))
+        with pytest.raises(TrainingDivergedError, match="no healthy checkpoint from step 2 or earlier"):
+            trainer.train()
+        assert trainer.rollbacks == [] and trainer.registry.get(trainer.run_id)["status"] == "failed"
+
+    def test_max_rollbacks_zero_disables_it(self, make_config):
+        trainer, _ = self.make(make_config, "off", samples_of_steps(8, 10), fault_tolerance={"max_rollbacks": 0})
+        with pytest.raises(TrainingDivergedError, match="3 consecutive non-finite steps"):
+            trainer.train()
+        assert trainer.rollbacks == []
+
+    def test_under_fp16_the_loss_scaler_is_left_usable(self, make_config):
+        """The guard raises between the scaler's unscale_() and update(); a scaler left in that
+        state refuses the next step."""
+        trainer, _ = self.make(make_config, "fp16", samples_of_steps(8, 10))
+        trainer.scaler = torch.amp.GradScaler("cpu")
+        result = trainer.train()
+        assert result.status == "completed" and len(trainer.rollbacks) == 1
+        assert all(torch.isfinite(p).all() for p in trainer.model.parameters())
+
+    def test_with_dataloader_workers(self, make_config):
+        """The epoch's iterator, and the workers behind it, are dropped and rebuilt at the new position."""
+        straight, _ = self.make(make_config, "w0", samples_of_steps(8, 10))
+        straight.train()
+        trainer, _ = self.make(make_config, "w1", samples_of_steps(8, 10), training={"num_workers": 1})
+        result = trainer.train()
+        assert result.status == "completed" and len(trainer.rollbacks) == 1
+        assert params_equal(straight.model, trainer.model)
+
+
 class TestTracking:
     def test_metrics_registry_and_run_dir(self, make_config):
         trainer, result = run(make_config, steps=10, training={"log_interval": 5})

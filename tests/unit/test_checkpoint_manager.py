@@ -14,6 +14,8 @@ from flextrain.checkpoint import (
     CheckpointSaveError,
     LocalStorage,
     NoUsableCheckpointError,
+    capture_state,
+    nonfinite_values,
     validate_checkpoint,
 )
 from flextrain.config import CheckpointConfig
@@ -269,6 +271,69 @@ class TestLineage:
         with manager(tmp_path, async_save=False) as mgr, caplog.at_level(logging.ERROR):
             assert mgr.load_latest_state()[1]["step"] == 1
         assert "falling back to the directory listing" in caplog.text
+
+
+class TestRewind:
+    """What a divergence rollback needs: find a healthy checkpoint, then abandon the ones after it."""
+
+    def test_rewinding_is_on_storage_before_it_returns(self, tmp_path):
+        """A restart right after a rollback to step 10 must not resume from step 20 or 30."""
+        model = SimpleModel()
+        mgr = manager(tmp_path, async_save=False)
+        for step in (10, 20, 30):
+            mgr.save(model, step=step)
+        mgr.rewind_lineage(10)
+        assert mgr.last_committed.step == 10 and mgr.last_saved_step == 10
+        with manager(tmp_path, async_save=False) as restarted:
+            assert restarted.load_latest_state()[1]["step"] == 10
+        assert len(names(tmp_path)) == 3  # the abandoned files stay until they are overwritten
+        mgr.save(model, step=12)  # the writer is not fenced off by its own rewind
+        assert [c.step for c in mgr.committed_checkpoints()] == [10, 12]
+        mgr.close()
+
+    def test_rewinding_respects_the_fence(self, tmp_path):
+        model = SimpleModel()
+        a, b = manager(tmp_path, async_save=False), manager(tmp_path, async_save=False)
+        a.save(model, step=1)
+        a.save(model, step=2)
+        b.save(model, step=3)  # takes the directory over
+        with pytest.raises(CheckpointConflictError, match="another process"):
+            a.rewind_lineage(1)
+        assert [c.step for c in b.committed_checkpoints()] == [1, 2, 3]
+
+    def test_only_rank_0_touches_storage(self, tmp_path):
+        mgr = manager(tmp_path, rank=1, async_save=False)
+        mgr.rewind_lineage(5)
+        assert mgr.last_saved_step == 5 and list(Path(tmp_path).iterdir()) == []
+
+    def test_newest_state_where_passes_over_later_corrupted_and_rejected_checkpoints(self, tmp_path, caplog):
+        model = SimpleModel()
+        mgr = manager(tmp_path, async_save=False, keep_last_n=10)
+        mgr.save(model, step=10)
+        with torch.no_grad():
+            model.fc1.weight[0, 0] = float("nan")
+        mgr.save(model, step=20)  # written after the weights blew up: loads fine, useless
+        corrupt(mgr.save(model, step=30))
+        mgr.save(model, step=40)
+        with caplog.at_level(logging.WARNING):
+            path, state = mgr.newest_state_where(35, nonfinite_values)
+        assert state["step"] == 10 and Path(path).name == "checkpoint_step00000010.pt"
+        assert "non-finite values in model.fc1.weight" in caplog.text
+        assert mgr.newest_state_where(5, nonfinite_values) is None
+        mgr.close()
+
+
+def test_nonfinite_values_looks_at_model_and_optimizer_floats_only():
+    model = SimpleModel()
+    optimizer = torch.optim.Adam(model.parameters())
+    train_a_bit(model, optimizer)
+    state = capture_state(model, optimizer)
+    state["trainer"] = {"loss": float("nan")}  # not a weight: a logged NaN does not condemn a checkpoint
+    assert nonfinite_values(state) is None
+    assert nonfinite_values({"model": {"count": torch.tensor(3)}, "optimizer": None}) is None
+    moments = next(iter(state["optimizer"]["state"].values()))
+    moments["exp_avg_sq"].view(-1)[0] = float("inf")
+    assert "optimizer.state" in nonfinite_values(state) and "exp_avg_sq" in nonfinite_values(state)
 
 
 class TestLoadFailures:

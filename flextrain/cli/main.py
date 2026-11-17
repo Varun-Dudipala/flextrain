@@ -121,7 +121,7 @@ def status(
         typer.echo("No running jobs found." if not all_runs else "No runs found.")
         return
     table = Table(title="FlexTrain runs")
-    for col in ("run", "status", "step", "loss", "world", "restarts", "last ckpt", "updated"):
+    for col in ("run", "status", "step", "loss", "world", "restarts", "rollbacks", "last ckpt", "updated"):
         table.add_column(col)
     for r in runs:
         loss = r.get("loss")
@@ -130,7 +130,7 @@ def status(
             r.get("run_id", "?"), state,
             f"{r.get('step', 0)}" + (f"/{r['max_steps']}" if r.get("max_steps") else ""),
             f"{loss:.4f}" if isinstance(loss, (int, float)) else "-",
-            str(r.get("world_size", "-")), str(r.get("restart_count", 0)),
+            str(r.get("world_size", "-")), str(r.get("restart_count", 0)), str(r.get("rollbacks", 0)),
             str(r.get("last_checkpoint_step", "-")),
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r.get("updated_at", 0))),
         )

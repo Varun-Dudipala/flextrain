@@ -13,8 +13,9 @@ One ``Trainer`` runs unchanged on a single CPU, one GPU, or many nodes launched 
   for a device->host snapshot; serialization and I/O run on a background thread.
 * **Coordinated preemption.** SIGTERM/SIGUSR1/SIGINT on *any* rank makes *all* ranks stop
   after the same step and write one consistent checkpoint.
-* **Divergence guard.** Non-finite gradient steps are skipped; persistent divergence
-  raises so the elastic agent restarts from the last good checkpoint.
+* **Divergence rollback.** Non-finite gradient steps are skipped. If they persist, every
+  rank goes back, in-process, to the newest checkpoint written before the first of them
+  that holds only finite values, skips the data up to the failure, and carries on.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -39,12 +40,13 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sequential
 from flextrain.checkpoint import (
     CheckpointManager,
     capture_rng_state,
+    nonfinite_values,
     restore_rng_state,
     restore_state,
 )
 from flextrain.config import Config, ConfigError, config_changes
 from flextrain.elastic import ElasticManager
-from flextrain.fault_tolerance import NonFiniteGuard, PreemptionHandler
+from flextrain.fault_tolerance import NonFiniteGuard, PreemptionHandler, TrainingDivergedError
 from flextrain.tracking import (
     COMPLETED,
     FAILED,
@@ -204,6 +206,9 @@ class Trainer:
         self.metrics_logger: Optional[MetricsLogger] = None
         self.resumed_from: Optional[str] = None
         self.lineage: Optional[str] = None  # id of the training history this run belongs to
+        self.rollbacks: List[Dict[str, Any]] = []  # every divergence rollback of this lineage, oldest first
+        self._rollbacks_in_a_row = 0
+        self._last_divergence_step: Optional[int] = None
         self.last_metrics: Dict[str, float] = {}
         self._last_checkpoint: Optional[str] = None
         self._last_checkpoint_time = time.monotonic()
@@ -435,35 +440,138 @@ class Trainer:
     def _train_loop(self) -> str:
         self.model.train()
         while not self._done():
-            self.sampler.set_epoch(self.epoch)
-            micro_step = 0
-            for batch in self.train_loader:
-                micro_step += 1
-                boundary = micro_step % self.accumulation_steps == 0
-                loss = self._forward_backward(batch, sync_gradients=boundary)
-                if self.preemption is not None:
-                    self.preemption.heartbeat()
-                self._window_loss_sum += loss.float()
-                self._window_micro_batches += 1
-                self._window_tokens += _count_tokens(batch)
-                if not boundary:
-                    continue
-
-                grad_norm, skipped = self._optimizer_step()
-                self.global_step += 1
-                self.sampler.advance(1)
-                self._window_steps += 1
-                self._last_grad_norm = grad_norm
-
-                if self._after_step():
-                    return PREEMPTED
-                if self._done():
-                    return COMPLETED
-            # epoch exhausted
+            diverged = None
+            try:
+                status = self._train_epoch()
+            except TrainingDivergedError as e:
+                if not self.config.fault_tolerance.max_rollbacks:
+                    raise
+                diverged = str(e)
+            # Outside the handler on purpose: the exception's traceback keeps the epoch's
+            # DataLoader iterator (and its worker processes) alive until the handler is left.
+            if diverged is not None:
+                self._rollback(diverged)
+                continue
+            if status is not None:
+                return status
             self.epoch += 1
             self.sampler.set_epoch(self.epoch)
             self.sampler.set_consumed(0)
         return COMPLETED
+
+    def _train_epoch(self) -> Optional[str]:
+        """Train from the sampler's position to the end of the epoch. Returns a status to stop with."""
+        self.sampler.set_epoch(self.epoch)
+        micro_step = 0
+        for batch in self.train_loader:
+            micro_step += 1
+            boundary = micro_step % self.accumulation_steps == 0
+            loss = self._forward_backward(batch, sync_gradients=boundary)
+            if self.preemption is not None:
+                self.preemption.heartbeat()
+            self._window_loss_sum += loss.float()
+            self._window_micro_batches += 1
+            self._window_tokens += _count_tokens(batch)
+            if not boundary:
+                continue
+
+            grad_norm, skipped = self._optimizer_step()
+            self.global_step += 1
+            self.sampler.advance(1)
+            self._window_steps += 1
+            self._last_grad_norm = grad_norm
+            if self._rollbacks_in_a_row and self.global_step > self._last_divergence_step:
+                self._rollbacks_in_a_row = 0  # further than last time: the next divergence is a new one
+
+            if self._after_step():
+                return PREEMPTED
+            if self._done():
+                return COMPLETED
+        return None
+
+    # ================================================================== divergence rollback
+    def _rollback(self, reason: str) -> None:
+        """Collective: go back to the newest healthy checkpoint and skip the data that led here.
+
+        Called on every rank at the same step (the guard's decision uses the all-reduced
+        gradient norm, which is identical everywhere). Raises ``TrainingDivergedError`` if
+        there is nothing healthy to go back to or the run keeps diverging.
+
+        Going back alone would achieve nothing: resume is exact, so the same data in the same
+        order reproduces the same divergence. The samples between the checkpoint and the
+        failure are therefore skipped (the remedy used for loss spikes in large language-model
+        training runs). Optimizer steps are not: the run continues at the checkpoint's step
+        count and learning-rate schedule, on later data.
+        """
+        ft, mgr = self.config.fault_tolerance, self.checkpoint_manager
+        failed_step = self.global_step + 1  # the step whose update the guard refused last
+        last_good_step = self.global_step - (self.nonfinite_guard.consecutive - 1)
+        if self._rollbacks_in_a_row >= ft.max_rollbacks:
+            raise TrainingDivergedError(
+                f"{reason}; giving up after {self._rollbacks_in_a_row} rollback(s) in a row "
+                f"(fault_tolerance.max_rollbacks={ft.max_rollbacks})")
+        # Where the data continues: just past the step that failed, whose batches are suspect too.
+        resume_epoch, resume_consumed = self.epoch, self.sampler.consumed + self.sampler.global_step_size
+        total_skipped = self.nonfinite_guard.total_skipped
+
+        with self.preemption.busy() if self.preemption is not None else contextlib.nullcontext():
+            # Checkpoints still being written may be the ones to go back to, or to discard.
+            self._agree(mgr.wait_for_pending, "a background checkpoint write failed")
+            path, state, error = None, None, None
+            if self.is_main_process:
+                try:
+                    found = mgr.newest_state_where(last_good_step, nonfinite_values)
+                    path, state = found if found is not None else (None, None)
+                except Exception as e:
+                    error = f"{type(e).__name__}: {e}"
+            path, error = broadcast_object((path, error))
+            if error is not None:
+                raise RuntimeError(f"cannot roll back: {error}")
+            if path is None:
+                raise TrainingDivergedError(
+                    f"{reason}; no healthy checkpoint from step {last_good_step} or earlier to roll back to")
+            if state is None:
+                state = self._agree(lambda: mgr.load_state(path), f"loading {path} failed")
+            else:
+                self._agree(lambda: None, f"loading {path} failed")
+
+            # The guard raised in the middle of an optimizer step: finish it without an update.
+            if self.scaler is not None:
+                self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+
+            self._restore(state)
+            skipped_from = {"epoch": self.epoch, "consumed": self.sampler.consumed}
+            self.epoch = resume_epoch
+            self.sampler.set_epoch(resume_epoch)
+            self.sampler.set_consumed(resume_consumed)
+            self.nonfinite_guard.reset_streak()
+            self.nonfinite_guard.total_skipped = total_skipped
+            self._rollbacks_in_a_row += 1
+            self._last_divergence_step = failed_step
+            record = {
+                "diverged_at_step": failed_step, "rolled_back_to_step": self.global_step, "checkpoint": path,
+                "skipped_data_from": skipped_from,
+                "skipped_data_to": {"epoch": resume_epoch, "consumed": resume_consumed},
+                "time": time.time(),
+            }
+            self.rollbacks.append(record)
+            self._reset_log_window()
+            logger.warning("Diverged at step %d (%s). Rolled back to step %d (%s), skipping the data from "
+                           "epoch %d sample %d to epoch %d sample %d; rollback %d of %d in a row",
+                           failed_step, reason, self.global_step, path, skipped_from["epoch"],
+                           skipped_from["consumed"], resume_epoch, resume_consumed,
+                           self._rollbacks_in_a_row, ft.max_rollbacks)
+
+            # Make it durable at once: first the lineage (a restart must not resume from a
+            # checkpoint of the abandoned stretch), then the new position and the rollback count
+            # (a restart must neither replay the skipped data nor get a fresh rollback budget).
+            self._agree(lambda: mgr.rewind_lineage(self.global_step), "recording the rollback failed")
+        self.save_checkpoint(blocking=True)
+        if self.is_main_process and self.metrics_logger is not None:
+            self.metrics_logger.log(dict(record), step=self.global_step, event="rollback")
+        self._update_registry(step=self.global_step, epoch=self.epoch, rollbacks=len(self.rollbacks),
+                              last_rollback=record)
 
     def _after_step(self) -> bool:
         """Logging, evaluation and checkpoint decisions. Returns True to stop (preemption)."""
@@ -577,6 +685,8 @@ class Trainer:
             "sampler": self.sampler.state_dict(),
             "run_name": self.run_name,
             "nonfinite_guard": self.nonfinite_guard.state_dict(),
+            "rollback": {"history": [dict(r) for r in self.rollbacks], "in_a_row": self._rollbacks_in_a_row,
+                         "last_divergence_step": self._last_divergence_step},
         }
 
     def save_checkpoint(self, blocking: bool = False) -> Optional[str]:
@@ -677,7 +787,7 @@ class Trainer:
         )
 
     def _resume(self) -> None:
-        cc, mgr = self.config.checkpoint, self.checkpoint_manager
+        mgr = self.checkpoint_manager
         launch_id = os.environ.get(LAUNCH_ID_ENV_VAR)
         mode, path, state, error = "fresh", None, None, None
         if self.is_main_process:
@@ -708,14 +818,31 @@ class Trainer:
         if mode == "continue":
             self._check_config_unchanged(state, path)
 
-        restore_state(state, self.model, self.optimizer, self.lr_scheduler, strict=cc.strict_resume)
+        self._restore(state)
+        ts = state["trainer"]
+        rollback = ts.get("rollback") or {}
+        self.rollbacks = [dict(r) for r in rollback.get("history", [])]
+        self._rollbacks_in_a_row = int(rollback.get("in_a_row", 0))
+        self._last_divergence_step = rollback.get("last_divergence_step")
+        if self.run_name is None:
+            self.run_name = ts.get("run_name")
+        self.elastic.on_resume({"world_size": state.get("world_size", self.world_size),
+                                "global_batch": state.get("global_batch")})
+        self.resumed_from = path
+        self.checkpoint_manager.last_saved_step = self.global_step
+        logger.info("%s %s at step %d (epoch %d, %d samples into the epoch; lineage %s)",
+                    "Continuing from" if mode == "continue" else "Branching a new lineage from",
+                    path, self.global_step, self.epoch, self.sampler.consumed, self.lineage[:8])
+
+    def _restore(self, state: Dict[str, Any]) -> None:
+        """Put model, optimizer, schedule, data position and RNGs back to what ``state`` holds."""
+        restore_state(state, self.model, self.optimizer, self.lr_scheduler,
+                      strict=self.config.checkpoint.strict_resume)
         ts = state["trainer"]
         self.global_step = int(ts["global_step"])
         self.epoch = int(ts["epoch"])
         self.sampler.load_state_dict(ts["sampler"])
         self.nonfinite_guard.load_state_dict(ts.get("nonfinite_guard", {}))
-        if self.run_name is None:
-            self.run_name = ts.get("run_name")
         if self.scaler is not None and state.get("grad_scaler"):
             self.scaler.load_state_dict(state["grad_scaler"])
 
@@ -725,13 +852,6 @@ class Trainer:
         else:
             # Topology changed: per-rank RNG streams cannot be mapped 1:1, reseed deterministically.
             set_seed(self.config.main.seed + self.rank + 100_003 * self.global_step)
-        self.elastic.on_resume({"world_size": state.get("world_size", self.world_size),
-                                "global_batch": state.get("global_batch")})
-        self.resumed_from = path
-        self.checkpoint_manager.last_saved_step = self.global_step
-        logger.info("%s %s at step %d (epoch %d, %d samples into the epoch; lineage %s)",
-                    "Continuing from" if mode == "continue" else "Branching a new lineage from",
-                    path, self.global_step, self.epoch, self.sampler.consumed, self.lineage[:8])
 
     # ================================================================== run bookkeeping
     def _start_run(self) -> None:

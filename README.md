@@ -28,7 +28,7 @@ Checkpoint written: .../checkpoint_step00000020.pt  <- background thread, fsync'
 | **Coordinated preemption** – SIGTERM to *any one* rank stops *all* ranks after the same step with one consistent checkpoint | signal handler only sets a flag; ranks agree via an all-reduce at step boundaries; `flextrain launch` forwards a scheduler's SIGTERM or a terminal's Ctrl-C to the job | `test_sigterm_to_one_rank_stops_all_ranks_at_the_same_step`, `test_stop_signal_to_the_launcher_stops_the_whole_job_cleanly` |
 | **Crash-safe storage** – a checkpoint is never observed half-written, and counts only once it is committed; retention deletes only checkpoints of the current lineage, and only after a newer one is committed | temp file → `fsync` → `os.replace` → `fsync(dir)`, then an atomically replaced `manifest.json` names it; pruning is part of that commit and is computed from the manifest (survives restarts) | `tests/unit/test_storage.py`, `tests/unit/test_checkpoint_manager.py` |
 | **No silent restarts from scratch** – a job that cannot use its checkpoints fails instead of starting over | corrupted checkpoints are skipped, unreachable ones are retried and then raised, and "the lineage has checkpoints but none is usable" is an error; a failure on one rank is agreed on by all ranks through an all-reduce | `TestLoadFailures`, `TestResumeFailures`, `test_checkpoint_write_failure_on_rank_0_stops_every_rank_together` |
-| **Divergence guard** – NaN/Inf steps are skipped; persistent divergence stops the run instead of letting it train on garbage | decision uses the post-all-reduce gradient norm, identical on every rank; the same guard applies under fp16, where the loss scaler alone would skip bad steps silently and forever | `TestDivergenceGuard` |
+| **Divergence rollback** – NaN/Inf steps are skipped; if they persist, every rank goes back, without a restart, to the newest checkpoint that predates them and holds only finite values, skips the data up to the failure and carries on. The result is bitwise identical to a run that never saw the skipped data (shown in a single process on CPU with injected NaN losses; with two ranks the test checks that both end with the same weights) | decision uses the post-all-reduce gradient norm, identical on every rank; the same guard applies under fp16, where the loss scaler alone would skip bad steps silently and forever; the rollback is committed to storage before training continues, and `max_rollbacks` in a row end the run | `TestDivergenceGuard`, `TestDivergenceRollback`, `test_divergence_is_rolled_back_on_every_rank_without_a_restart` |
 
 DDP training is verified to stay bitwise-identical across ranks and to match single-process
 training with gradient accumulation (`test_two_ranks_match_single_process_with_accumulation`).
@@ -142,6 +142,28 @@ checkpoints because their step numbers are higher. The rules:
 - The manifest carries a writer token. A process that finds another writer's token where it
   expected its own stops, so two jobs pointed at one directory cannot interleave for long.
 
+**Divergence rollback.** Skipping a step whose gradient is NaN or infinite protects the weights
+from that step. When the steps keep coming (`max_consecutive_nonfinite` in a row), the run has
+diverged, and restarting it does not help: resume is exact, so the same data in the same order
+produces the same divergence. FlexTrain instead does in-process what the PaLM authors did by hand
+for loss spikes ([Chowdhery et al., 2022](https://arxiv.org/abs/2204.02311), section 5.1): go back
+to an earlier checkpoint and skip the data that led to the failure.
+
+- *Which checkpoint.* The newest one from before the first non-finite step whose model and
+  optimizer state contain only finite values. The second condition matters: weights can turn to
+  NaN one step before any gradient does, and a checkpoint written in between loads without error.
+- *What is skipped.* The samples between that checkpoint's data position and the end of the step
+  that failed. Optimizer steps are not skipped: the run continues at the checkpoint's step count
+  and learning-rate schedule, on later data.
+- *Durability.* Before training continues, the manifest drops the checkpoints of the abandoned
+  stretch and a checkpoint with the new data position and the rollback count is written. A job
+  that is killed right after a rollback therefore neither resumes from an abandoned checkpoint,
+  nor replays the skipped data, nor gets a fresh rollback budget.
+- *When it gives up.* After `fault_tolerance.max_rollbacks` (default 2) rollbacks in a row. The
+  count resets once training gets past the step where it last diverged. `max_rollbacks: 0` turns
+  rollback off. Every rollback is logged, written to `metrics.jsonl` and shown in the run registry
+  and dashboard.
+
 **Failure handling.**
 
 | Failure | What happens |
@@ -159,7 +181,7 @@ checkpoints because their step numbers are higher. The rules:
 | Every checkpoint of the lineage is corrupted | The job fails with the list of problems instead of silently training from scratch |
 | Rerun with changed hyperparameters in the same directory | Refused with the list of changed settings (`checkpoint.allow_config_change` to override) |
 | A second job writes to the same checkpoint directory | The job that finds a foreign writer token in the manifest stops with `CheckpointConflictError` |
-| Loss/gradients become NaN/Inf | Step skipped; more than `max_consecutive_nonfinite` in a row raises and the run is marked `failed`. Under the elastic agent the group is then restarted from the last checkpoint, but exact resume replays the same data and randomness, so a divergence that is deterministic comes back; the restarts are bounded by `elastic.max_restarts`. Getting past it takes a change, e.g. branching from an earlier checkpoint with `resume_path` and a lower learning rate |
+| Loss/gradients become NaN/Inf | Step skipped. More than `max_consecutive_nonfinite` in a row triggers a rollback: all ranks reload the newest healthy checkpoint from before the first bad step, skip the data up to the failure and continue, with no restart. If there is no such checkpoint, or after `max_rollbacks` rollbacks in a row, the run raises and is marked `failed`; a restart by the elastic agent then fails the same way at once, because the rollback count is in the checkpoint. Rollback skips data and changes nothing else, so it does not rescue a run whose settings make it unstable (e.g. a learning rate that is too high) |
 
 ## Benchmarks
 
@@ -221,17 +243,17 @@ make chaos              # randomized fault injection campaign (see below)
 pytest tests/gpu        # CUDA-only paths (AMP bf16/fp16, pinned snapshots); skipped without a GPU
 ```
 
-348 test cases (parametrized cases counted individually; ~4.0k lines of tests for ~5.0k lines of
+366 test cases (parametrized cases counted individually; ~4.3k lines of tests for ~5.2k lines of
 library code):
 
 | Area | What is verified |
 |---|---|
-| Config (70) | type coercion incl. YAML `1e-4`, unknown-key errors with suggestions, every validation rule, overrides, round-trips |
-| Checkpointing (78) | safe loading (no arbitrary unpickling), lineage manifest as the commit point, retention scoped to the lineage, a second writer is fenced off, corrupted vs. unreachable checkpoints, SHA-256 digests catch flipped bytes that `torch.load` accepts, atomic writes leave no partial files, failed writes keep the previous checkpoint, async saves return before the write and are isolated snapshots, FIFO order, backpressure, drain on close, failures surface once, retention across restarts, corrupted-checkpoint fallback, GCS/S3 against fakes |
-| Trainer (59) | `resume_path` applied once, changed hyperparameters refused, no silent restart from scratch, exact (bitwise) resume after a crash and after preemption, also with random augmentation in DataLoader workers, fp16 divergence guard, accumulation ≡ large batch, activation checkpointing ≡ none, divergence guard, LR schedules, checkpoint policy, eval, tracking |
+| Config (71) | type coercion incl. YAML `1e-4`, unknown-key errors with suggestions, every validation rule, overrides, round-trips |
+| Checkpointing (83) | safe loading (no arbitrary unpickling), lineage manifest as the commit point, rewinding a lineage durably, finding the newest checkpoint with only finite values, retention scoped to the lineage, a second writer is fenced off, corrupted vs. unreachable checkpoints, SHA-256 digests catch flipped bytes that `torch.load` accepts, atomic writes leave no partial files, failed writes keep the previous checkpoint, async saves return before the write and are isolated snapshots, FIFO order, backpressure, drain on close, failures surface once, retention across restarts, corrupted-checkpoint fallback, GCS/S3 against fakes |
+| Trainer (70) | divergence rollback (result bitwise identical to a run that never saw the skipped data, durable across a kill right after it, abandoned checkpoints never resumed from, NaN-weight checkpoints passed over, gives up after `max_rollbacks` in a row, works under the fp16 loss scaler and with DataLoader workers), `resume_path` applied once, changed hyperparameters refused, no silent restart from scratch, exact (bitwise) resume after a crash and after preemption, also with random augmentation in DataLoader workers, fp16 divergence guard, accumulation ≡ large batch, activation checkpointing ≡ none, divergence guard, LR schedules, checkpoint policy, eval, tracking |
 | Sampler / elastic / fault tolerance (67) | stop watchdog frees a rank blocked in C++, launcher exit codes and stop signals, agent stops when its launcher dies, per-sample seeding independent of workers, world size and resume position, resume mid-epoch, re-sharding across world sizes without repeats or gaps, global-batch preservation, torchrun command construction, per-attempt rendezvous isolation, signal handling, launcher settles the status of dead runs |
 | API / CLI / tracking (42) | endpoints, stale-run detection, CLI commands end to end, crash-tolerant JSONL, atomic registry |
-| Multi-process integration (15) | real `torchrun` jobs: DDP sync, killing the launcher stops the job, rank-0 write failure stops every rank together, crash → elastic restart → bitwise-identical result, frozen rank → timeout → restart, coordinated preemption, stop signals to the launcher, 2→1 rank resize, fixed-seed randomized kills |
+| Multi-process integration (16) | real `torchrun` jobs: DDP sync, divergence rolled back on both ranks without a restart, killing the launcher stops the job, rank-0 write failure stops every rank together, crash → elastic restart → bitwise-identical result, frozen rank → timeout → restart, coordinated preemption, stop signals to the launcher, 2→1 rank resize, fixed-seed randomized kills |
 | Example + GPU (17) | GPT-2 causality and shapes, example script end to end; CUDA AMP / pinned snapshots (GPU only) |
 
 ### Randomized fault injection
@@ -286,7 +308,7 @@ works). Any value can be overridden with `--set section.key=value`.
 | `distributed` | `ddp` / `fsdp`, backend, collective timeout, FSDP sharding/prefetch/offload, `wrap_modules`, bf16/fp16, activation checkpointing |
 | `checkpoint` | dir / `local`·`gcs`·`s3`, step- and time-based intervals, async + max in-flight saves, retention, SHA-256 digests, resume policy, `allow_config_change`, `allow_pickle` |
 | `elastic` | nodes `min:max`, procs per node, rendezvous, `max_restarts`, `shutdown_timeout` (window for a preemption checkpoint) |
-| `fault_tolerance` | handled signals, stop-check interval, `stop_grace_seconds` (watchdog for blocked ranks), non-finite guard |
+| `fault_tolerance` | handled signals, stop-check interval, `stop_grace_seconds` (watchdog for blocked ranks), non-finite guard, `max_rollbacks` (divergence rollback) |
 | `model`, `data` | free-form, passed through to your script |
 
 ## Project layout
@@ -296,7 +318,7 @@ flextrain/
 ├── config/           typed config sections, strict loader, overrides
 ├── core/             Trainer, process-group setup, resumable sampler, DDP/FSDP wrapping
 ├── checkpoint/       storage backends + digests, snapshot buffers, async writer, lineage manifest, manager
-├── fault_tolerance/  coordinated preemption + stop watchdog, non-finite guard
+├── fault_tolerance/  coordinated preemption + stop watchdog, non-finite guard (rollback lives in the trainer)
 ├── elastic/          launcher (signals, exit status), agent wrapper around torchrun, resize-aware resume
 ├── tracking/         JSONL metrics, run registry
 ├── api/              FastAPI service + dashboard
@@ -319,8 +341,11 @@ results/                  raw data behind the numbers quoted in this README
 - **Multi-node needs shared or object storage.** Every rank loads the checkpoint that rank 0 chose,
   from the same path; node-local disks will not work, and each rank holds a full copy in host memory
   while it loads.
-- **Divergence is detected, not cured.** See the failure table: a restart replays a deterministic
-  divergence. Rolling back and skipping ahead in-process is not implemented.
+- **Divergence rollback is narrow.** It is triggered only by non-finite gradients (a loss that
+  spikes but stays finite does not trigger it), and it changes only the data: a run that is
+  unstable because of its settings diverges again and fails after `max_rollbacks`. It was tested by
+  injecting NaN losses and NaN weights on CPU with one and two ranks, not with a model that
+  diverges on its own, and not on a GPU or with FSDP.
 - **Evaluation is approximate under DDP.** It uses the stock `DistributedSampler`, which pads with
   repeated samples, and averages per-batch means.
 - **Data pipeline.** Map-style datasets only, and each epoch's permutation is materialized in memory

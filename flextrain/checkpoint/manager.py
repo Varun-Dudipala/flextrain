@@ -32,7 +32,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -217,6 +217,43 @@ class CheckpointManager:
             self._manifest = manifest
         return self._manifest
 
+    def _stored_manifest_if_still_ours(self, manifest: Manifest) -> Optional[Manifest]:
+        """The manifest on storage, after checking that no other process has written it since we did."""
+        stored = self.stored_manifest()
+        if self._committed and (stored is None or stored.writer != self._writer_id
+                                or stored.generation != manifest.generation):
+            raise CheckpointConflictError(
+                f"another process is writing checkpoints to {self.checkpoint_dir} "
+                f"(the manifest changed since this process last wrote it); refusing to interleave"
+            )
+        return stored
+
+    def _write_manifest(self, manifest: Manifest, stored: Optional[Manifest]) -> None:
+        manifest.writer = self._writer_id
+        manifest.generation = (stored.generation if stored is not None else 0) + 1
+        self.storage.write_bytes(self.manifest_path, manifest.to_bytes())
+        self._committed = True
+
+    def rewind_lineage(self, step: int) -> None:
+        """Drop the lineage's checkpoints after ``step``, durably: the run has gone back to ``step``.
+
+        Until this is on storage a restart would resume from one of the dropped checkpoints.
+        Their files are left in place (they are overwritten as training passes those steps
+        again, and until then they are what is left to examine of the abandoned stretch).
+        Call on every rank; only rank 0 touches storage.
+        """
+        self.last_saved_step = step
+        if not self.is_main_process:
+            return
+        with self._lock:
+            manifest = self._ensure_lineage()
+            stored = self._stored_manifest_if_still_ours(manifest)
+            manifest.checkpoints = [e for e in manifest.checkpoints if e.step <= step]
+            self._write_manifest(manifest, stored)
+            kept = manifest.sorted_entries()
+            self.last_committed = (CheckpointInfo(path=self.storage.join(self.checkpoint_dir, kept[-1].file),
+                                                  step=kept[-1].step) if kept else None)
+
     def _commit(self, path: str, nbytes: int) -> None:
         """Make the durable checkpoint at ``path`` part of the lineage, then prune.
 
@@ -230,22 +267,13 @@ class CheckpointManager:
         step = int(match.group(1))
         with self._lock:
             manifest = self._ensure_lineage()
-            stored = self.stored_manifest()
-            if self._committed and (stored is None or stored.writer != self._writer_id
-                                    or stored.generation != manifest.generation):
-                raise CheckpointConflictError(
-                    f"another process is writing checkpoints to {self.checkpoint_dir} "
-                    f"(the manifest changed since this process last wrote it); refusing to interleave"
-                )
+            stored = self._stored_manifest_if_still_ours(manifest)
             entries = [e for e in manifest.checkpoints if e.step != step]
             entries.append(ManifestEntry(step=step, file=name, nbytes=nbytes, time=time.time()))
             entries.sort(key=lambda e: e.step)
             pruned = entries[: max(0, len(entries) - self.config.keep_last_n)]
             manifest.checkpoints = entries[len(pruned):]
-            manifest.writer = self._writer_id
-            manifest.generation = (stored.generation if stored is not None else 0) + 1
-            self.storage.write_bytes(self.manifest_path, manifest.to_bytes())
-            self._committed = True
+            self._write_manifest(manifest, stored)
             if any(e.step == step for e in manifest.checkpoints):
                 self.last_committed = CheckpointInfo(path=path, step=step)
         for entry in pruned:
@@ -368,6 +396,26 @@ class CheckpointManager:
                 f"({'; '.join(skipped)}). Refusing to silently start from step 0: repair or remove them, "
                 f"or set checkpoint.auto_resume=false to begin a new lineage."
             )
+        return None
+
+    def newest_state_where(self, max_step: int, problem_with: Callable[[Dict[str, Any]], Optional[str]]
+                           ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """The lineage's newest checkpoint at or before ``max_step`` that ``problem_with`` accepts.
+
+        ``problem_with`` returns ``None`` for a state it accepts and the reason otherwise.
+        Corrupted and missing checkpoints are skipped as well. Returns ``None`` if nothing
+        qualifies; storage errors propagate.
+        """
+        for info in reversed([c for c in self.committed_checkpoints() if c.step <= max_step]):
+            try:
+                state = self.load_state(info.path)
+            except (CheckpointCorruptedError, FileNotFoundError) as e:
+                logger.warning("Skipping unusable checkpoint %s: %s", info.path, e)
+                continue
+            problem = problem_with(state)
+            if problem is None:
+                return info.path, state
+            logger.warning("Skipping checkpoint %s: %s", info.path, problem)
         return None
 
     def load(

@@ -46,8 +46,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="card">
     <table>
       <thead><tr><th>Run</th><th>Status</th><th>Step</th><th>Epoch</th><th>Loss</th><th>Samples/s</th>
-        <th>World</th><th>Restarts</th><th>Last checkpoint</th><th>Updated</th></tr></thead>
-      <tbody id="rows"><tr><td colspan="10" class="empty">No runs yet. Start one with <code>flextrain launch</code>.</td></tr></tbody>
+        <th>World</th><th>Restarts</th><th>Rollbacks</th><th>Last checkpoint</th><th>Updated</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="11" class="empty">No runs yet. Start one with <code>flextrain launch</code>.</td></tr></tbody>
     </table>
   </div>
   <div class="card" id="chart" hidden><h2 id="chart-title"></h2><svg id="svg" width="100%" height="240"></svg></div>
@@ -73,6 +73,7 @@ async function refresh() {
         <td class="num">${fmt(j.step, 0)}${j.max_steps ? " / " + esc(j.max_steps) : ""}</td><td class="num">${fmt(j.epoch, 0)}</td>
         <td class="num">${fmt(j.loss)}</td><td class="num">${fmt(j.samples_per_s, 1)}</td>
         <td class="num">${fmt(j.world_size, 0)}</td><td class="num">${fmt(j.restart_count, 0)}</td>
+        <td class="num">${fmt(j.rollbacks || 0, 0)}</td>
         <td>${ckpt}</td><td>${ago(j.seconds_since_update)}</td></tr>`;
     }).join("");
     if (rows) document.getElementById("rows").innerHTML = rows;

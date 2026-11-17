@@ -27,6 +27,7 @@ from tests.integration.harness import (
     job_env,
     launch_cmd,
     process_alive,
+    read_records,
     results,
     run_job,
     step_samples,
@@ -91,6 +92,41 @@ def test_worker_crash_is_recovered_by_elastic_restart(baseline, tmp_path):
 
     registry = json.loads((tmp_path / "home" / "runs").glob("*.json").__next__().read_text())
     assert registry["status"] == "completed" and registry["restart_count"] == 1
+
+
+def test_divergence_is_rolled_back_on_every_rank_without_a_restart(tmp_path):
+    """The data of steps 7-9 produces NaN losses. Steps 7 and 8 are skipped, step 9 trips the
+    guard, and both ranks go back to the checkpoint of step 5 and continue with the data of
+    step 10 - in the same processes, with no help from the elastic agent."""
+    out = tmp_path / "out"
+    permutation = expected_permutation(0)
+    bad = permutation[6 * GLOBAL_BATCH: 9 * GLOBAL_BATCH]
+    config = write_config(tmp_path, fault_tolerance__max_consecutive_nonfinite=2)
+    proc = run_job(config, tmp_path, out, nproc=2, FT_BAD_SAMPLES=",".join(map(str, bad)))
+    assert_ok(proc)
+
+    res = results(out)
+    assert res[0]["restart"] == res[1]["restart"] == 0
+    assert res[0]["step"] == res[1]["step"] == 12 and res[0]["status"] == "completed"
+    assert res[0]["digest"] == res[1]["digest"], "ranks diverged from each other across the rollback"
+    for rank in (0, 1):
+        (record,) = res[rank]["rollbacks"]
+        assert (record["diverged_at_step"], record["rolled_back_to_step"]) == (9, 5)
+        assert record["skipped_data_to"] == {"epoch": 0, "consumed": 9 * GLOBAL_BATCH}
+
+    # What was trained on after the rollback: everything each rank logged after its failed step 9.
+    after: List[dict] = []
+    for rank in (0, 1):
+        records = read_records(out / f"samples_rank{rank}.jsonl")
+        failed = max(i for i, rec in enumerate(records) if rec["step"] == 9 and set(rec["idx"]) & set(bad))
+        after.extend(records[failed + 1:])
+    first_step = sorted(i for rec in after if rec["step"] == 6 for i in rec["idx"])
+    assert first_step == sorted(permutation[9 * GLOBAL_BATCH: 10 * GLOBAL_BATCH])
+    in_epoch_0 = {i for rec in after if rec["step"] <= 8 for i in rec["idx"]}  # steps 6-8 end epoch 0
+    assert not in_epoch_0 & set(permutation[5 * GLOBAL_BATCH: 9 * GLOBAL_BATCH]), "skipped data came back"
+
+    registry = json.loads((tmp_path / "home" / "runs").glob("*.json").__next__().read_text())
+    assert registry["status"] == "completed" and registry["rollbacks"] == 1 and registry["restart_count"] == 0
 
 
 def test_crash_without_restarts_fails_the_job(tmp_path):
