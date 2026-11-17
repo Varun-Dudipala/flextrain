@@ -107,6 +107,41 @@ def _hash_stream(stream: BinaryIO) -> str:
         sha.update(view[:n])
 
 
+class _HashingWriter:
+    """Write-only view of a file that hashes the bytes on their way through.
+
+    ``torch.save`` writes a checkpoint front to back, so hashing what it writes gives the
+    digest of the file without reading it again: one pass over the data instead of two. The
+    hash is updated before ``write`` returns because torch reuses the buffer it passes in.
+    There is deliberately no ``seek``: a writer that went back to patch earlier bytes would
+    make the digest wrong, and must fail here instead.
+    """
+
+    def __init__(self, stream: BinaryIO):
+        self._stream = stream
+        self._sha = hashlib.sha256()
+
+    def write(self, data) -> int:
+        self._sha.update(data)  # releases the GIL for all but tiny buffers
+        return self._stream.write(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def hexdigest(self) -> str:
+        return self._sha.hexdigest()
+
+
+def _dump(state: Dict[str, Any], stream: BinaryIO, checksum: bool) -> Optional[str]:
+    """``torch.save`` ``state`` to ``stream``; returns the SHA-256 of what was written if asked to."""
+    if not checksum:
+        torch.save(state, stream)
+        return None
+    writer = _HashingWriter(stream)
+    torch.save(state, writer)
+    return writer.hexdigest()
+
+
 class StorageBackend(ABC):
     """Abstract checkpoint store."""
 
@@ -235,13 +270,10 @@ class LocalStorage(StorageBackend):
         tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
         digest = None
         try:
-            with open(tmp_path, "w+b") as f:
-                torch.save(state, f)
+            with open(tmp_path, "wb") as f:
+                digest = _dump(state, f, self.checksum)
                 f.flush()
                 nbytes = f.tell()
-                if self.checksum:
-                    f.seek(0)
-                    digest = _hash_stream(f)  # read back through the page cache
                 if self.fsync:
                     _sync(f.fileno())
             self.delete_digest(path)  # never let an older digest describe the new bytes
@@ -298,21 +330,21 @@ class LocalStorage(StorageBackend):
         return str(Path(directory) / name)
 
 
-def _serialize(state: Dict[str, Any]):
-    """Serialize to an anonymous temp file (returns it rewound).
+def _serialize(state: Dict[str, Any], checksum: bool = False):
+    """Serialize to an anonymous temp file. Returns it rewound, and its SHA-256 if asked to.
 
     Writing to a real file lets ``torch.save`` release the GIL during I/O, so a background
     upload does not stall the training thread; ``io.BytesIO`` writes hold the GIL.
     """
     spool = tempfile.TemporaryFile()
     try:
-        torch.save(state, spool)
+        digest = _dump(state, spool, checksum)
         spool.flush()
         spool.seek(0)
     except BaseException:
         spool.close()
         raise
-    return spool
+    return spool, digest
 
 
 def _key(path: PathLike) -> str:
@@ -335,12 +367,9 @@ class _ObjectStorage(StorageBackend):
         ...
 
     def save(self, state: Dict[str, Any], path: PathLike) -> int:
-        with _serialize(state) as spool:
+        spool, digest = _serialize(state, self.checksum)
+        with spool:
             nbytes = os.fstat(spool.fileno()).st_size
-            digest = None
-            if self.checksum:
-                digest = _hash_stream(spool)
-                spool.seek(0)
             self.delete_digest(path)  # never let an older digest describe the new bytes
             self._upload(spool, path, nbytes)
         if digest is not None:

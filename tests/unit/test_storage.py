@@ -122,6 +122,44 @@ class TestIntegrity:
         expected = hashlib.sha256(path.read_bytes()).hexdigest()
         assert Path(digest_path(path)).read_text() == f"{expected}  checkpoint_step00000001.pt\n"
 
+    def test_digest_is_computed_while_writing_not_by_reading_the_file_back(self, tmp_path, monkeypatch):
+        """One pass over the data instead of two. The state has many tensors of very different
+        sizes, so the digest covers every kind of write torch.save makes (headers of a few bytes,
+        records of megabytes), and it must still be the SHA-256 of the file as it is on disk."""
+        import flextrain.checkpoint.storage as storage_module
+
+        def no_reading_back(stream):
+            raise AssertionError("the checkpoint was read back to hash it")
+
+        state = {"model": {f"w{i}": torch.randn(n) for i, n in enumerate([1, 7, 1000, 300_000, 2_000_000])},
+                 "trainer": {"global_step": 5, "note": "x" * 5000}}
+        path = tmp_path / "c.pt"
+        with monkeypatch.context() as m:
+            m.setattr(storage_module, "_hash_stream", no_reading_back)
+            nbytes = LocalStorage().save(state, path)
+        assert nbytes == path.stat().st_size
+        assert Path(digest_path(path)).read_text().split()[0] == hashlib.sha256(path.read_bytes()).hexdigest()
+        loaded = LocalStorage().load(path)  # verifies the digest against the stored bytes
+        assert all(torch.equal(loaded["model"][k], v) for k, v in state["model"].items())
+
+    def test_the_hashing_writer_cannot_be_rewound(self):
+        """A serializer that went back to patch earlier bytes would leave a digest that does not
+        describe the file. It has to fail instead."""
+        from flextrain.checkpoint.storage import _HashingWriter
+
+        writer = _HashingWriter(io.BytesIO())
+        writer.write(b"abc")
+        assert writer.hexdigest() == hashlib.sha256(b"abc").hexdigest()
+        assert not hasattr(writer, "seek") and not hasattr(writer, "tell")
+
+    def test_object_store_digest_describes_the_uploaded_bytes(self):
+        client = FakeS3Client()
+        storage = S3Storage("b", client=client)
+        storage.save({"w": torch.randn(50_000), "small": torch.ones(3)}, "ckpt/k.pt")
+        uploaded = client.store["ckpt/k.pt"]
+        assert storage.read_digest("ckpt/k.pt") == hashlib.sha256(uploaded).hexdigest()
+        assert torch.equal(storage.load("ckpt/k.pt")["small"], torch.ones(3))
+
     def test_checkpoint_without_digest_loads_unverified(self, tmp_path):
         """Checkpoints written before digests existed, or whose writer died before the digest landed."""
         path = tmp_path / "c.pt"

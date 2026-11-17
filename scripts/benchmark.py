@@ -6,7 +6,10 @@ Measures, for the example GPT-2 model with a realistic checkpoint (weights + Ada
 1. **Training stall per checkpoint**: how long the training loop is blocked by a
    synchronous save vs. an async save (device->host snapshot only). Median of N repeats;
    the first async save (which allocates the reusable host buffers) is reported separately.
-2. **Persist throughput**: checkpoint bytes / background serialize+write+fsync time.
+2. **Persist throughput**: checkpoint bytes / background serialize+hash+write+flush time,
+   and next to it the *floor*: the same number of bytes written raw and flushed the same way.
+   A save and a floor write alternate, because a disk's speed drifts while it is written to;
+   the ratio of each adjacent pair says how much of the save is the disk and how much is us.
 3. **Load throughput / resume time**: reading the checkpoint with a *cold* page cache
    (evicted via posix_fadvise) and warm, plus the full restore into model + optimizer.
 4. **End-to-end overhead**: wall time of the real ``Trainer`` loop with checkpoints every K
@@ -43,6 +46,7 @@ from model import create_gpt2_model  # noqa: E402
 
 from flextrain import Config, Trainer  # noqa: E402
 from flextrain.checkpoint import CheckpointManager, LocalStorage, restore_state  # noqa: E402
+from flextrain.checkpoint.storage import _sync as flush_to_disk  # noqa: E402
 from flextrain.config import CheckpointConfig  # noqa: E402
 
 
@@ -92,6 +96,20 @@ def make_model_and_optimizer(size: str, device: torch.device, seq_len: int):
     return model, optimizer
 
 
+def raw_write_seconds(path: Path, nbytes: int, chunk: bytes) -> float:
+    """Time writing ``nbytes`` of incompressible data to ``path`` and flushing it to the disk."""
+    t0 = time.perf_counter()
+    with open(path, "wb") as f:
+        for _ in range(nbytes // len(chunk)):
+            f.write(chunk)
+        f.write(chunk[: nbytes % len(chunk)])
+        f.flush()
+        flush_to_disk(f.fileno())
+    elapsed = time.perf_counter() - t0
+    path.unlink()
+    return elapsed
+
+
 def bench_checkpoint(model, optimizer, device, workdir: Path, repeats: int) -> Dict[str, float]:
     results: Dict[str, float] = {}
 
@@ -113,22 +131,28 @@ def bench_checkpoint(model, optimizer, device, workdir: Path, repeats: int) -> D
     async_dir = workdir / "async"
     mgr = CheckpointManager(CheckpointConfig(checkpoint_dir=str(async_dir), async_save=True, keep_last_n=2),
                             pin_memory=device.type == "cuda")
-    first_block, block_times, write_times = None, [], []
+    first_block, block_times, write_times, raw_times = None, [], [], []
+    chunk = os.urandom(32 * 1024 * 1024)
     for i in range(repeats + 1):
         sync_device(device)
         t0 = time.perf_counter()
         mgr.save(model, optimizer, step=i)
         blocked = time.perf_counter() - t0
         mgr.wait_for_pending()
-        write_times.append(mgr.history[-1].write_seconds)
         if i == 0:
             first_block = blocked  # includes one-time host buffer allocation
         else:
             block_times.append(blocked)
+            write_times.append(mgr.history[-1].write_seconds)
+            raw_times.append(raw_write_seconds(async_dir / "raw.bin", nbytes, chunk))
     mgr.close()
     results["async_block_first_ms"] = first_block * 1e3
     results["async_block_ms"] = median(block_times) * 1e3
     results["persist_mbps"] = nbytes / 1e6 / median(write_times)
+    results["raw_write_mbps"] = nbytes / 1e6 / median(raw_times)
+    results["persist_pct_of_raw"] = 100 * median([raw / save for raw, save in zip(raw_times, write_times, strict=True)])
+    results["persist_seconds"] = write_times
+    results["raw_write_seconds"] = raw_times
     results["stall_reduction_pct"] = 100 * (1 - results["async_block_ms"] / results["sync_block_ms"])
 
     # --- load / resume
@@ -252,7 +276,10 @@ def main() -> int:
     print(f"| Training stall, async save (steady state) | {ckpt['async_block_ms']:.0f} ms |")
     print(f"| Training stall, async save (first, allocates host buffers) | {ckpt['async_block_first_ms']:.0f} ms |")
     print(f"| **Stall reduction (async vs sync)** | **{ckpt['stall_reduction_pct']:.1f}%** |")
-    print(f"| Background persist throughput (serialize + write + fsync) | {ckpt['persist_mbps']:.0f} MB/s |")
+    print(f"| Background persist throughput (serialize + SHA-256 + write + flush) | {ckpt['persist_mbps']:.0f} MB/s |")
+    print(f"| Floor: the same bytes written raw and flushed, alternating with the saves | "
+          f"{ckpt['raw_write_mbps']:.0f} MB/s |")
+    print(f"| Save speed relative to that floor (median of adjacent pairs) | {ckpt['persist_pct_of_raw']:.0f}% |")
     if "load_cold_mbps" in ckpt:
         print(f"| Load throughput, cold page cache | {ckpt['load_cold_mbps']:.0f} MB/s |")
     print(f"| Load throughput, warm page cache | {ckpt['load_warm_mbps']:.0f} MB/s |")

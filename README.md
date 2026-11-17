@@ -119,9 +119,11 @@ sample (measured on an Apple M-series laptop; `training.seed_per_sample: false` 
 
 **Checkpoint integrity.** A `<checkpoint>.sha256` file (readable by `shasum -a 256 -c`) is written
 after the checkpoint itself is durable and, when present, checked on every load (a checkpoint
-whose writer died between those two writes is complete but loads unverified). Hashing runs on the writer
-thread and added about 0.9 s per GB to the background write and 0.4 s per GB to a load on the same
-laptop; `checkpoint.checksum: false` turns it off.
+whose writer died between those two writes is complete but loads unverified). The digest is
+computed on the writer thread from the bytes as they are written, so a save passes over the data
+once (reading the file back to hash it, as an earlier version did, cost a second pass). SHA-256
+itself ran at about 3 GB/s on the same laptop, and verifying a checkpoint added 0.4 s per GB to a
+load; `checkpoint.checksum: false` turns it off.
 
 **Checkpoint identity.** A directory and a step number do not identify a checkpoint: reruns,
 rollbacks and restarts all write `checkpoint_step<N>.pt` into the same place. Each directory
@@ -197,9 +199,30 @@ data in [`results/benchmark_macos_arm64.json`](results/benchmark_macos_arm64.jso
 | Training stall per checkpoint, synchronous save | 1.83 s |
 | Training stall per checkpoint, **async save** | **0.11 s (−94%)** |
 | First async save (allocates the reusable host buffers once) | 0.13 s |
-| Background persist throughput (serialize + write + SHA-256 + flush to disk + manifest commit) | 601 MB/s |
+| Background persist throughput (serialize + write + SHA-256 + flush to disk + manifest commit), before single-pass hashing | 601 MB/s |
 | Checkpoint load throughput, warm page cache (includes verifying the digest) | 1.9 GB/s |
 | Resume: load + restore model and optimizer | 0.80 s |
+
+**Persist throughput is now bounded by the disk.** The table was measured before saves hashed
+the bytes on their way to the file. A paired comparison on the same laptop, alternating the
+previous write path, the current one and a raw write of the same number of bytes, each ending in
+the same flush to disk (7 saves each, medians; raw data in
+[`results/persist_paired_macos_arm64.json`](results/persist_paired_macos_arm64.json)):
+
+| Write path, 1.49 GB checkpoint | Throughput |
+|---|---|
+| Previous: write, then read the file back to hash it | 592 MB/s |
+| **Current: hash while writing** | **994 MB/s** |
+| Floor: the same bytes written raw | 1,036 MB/s |
+
+The current path is within about 5% of what the disk does with raw bytes, so there is little
+left to gain in software on this machine. The comparison is paired because this disk's speed is
+not a constant: its raw write speed ranged from about 290 MB/s to above 1 GB/s over one afternoon
+of benchmarking (sustained writes slow it down, and so do other applications). `make bench`
+therefore now writes the raw floor next to every save and reports their ratio, which is the
+number that carries over to another machine. The other rows of the table have not been
+re-measured since this change; the synchronous-save stall includes the same write and will have
+shrunk with it.
 
 End to end – 30 training steps with a checkpoint every 10 – checkpointing costs **39%** extra wall
 time with synchronous saves and **30%** with async saves (−24%). The end-to-end gain is much
@@ -243,13 +266,13 @@ make chaos              # randomized fault injection campaign (see below)
 pytest tests/gpu        # CUDA-only paths (AMP bf16/fp16, pinned snapshots); skipped without a GPU
 ```
 
-367 test cases (parametrized cases counted individually; ~4.3k lines of tests for ~5.2k lines of
+370 test cases (parametrized cases counted individually; ~4.3k lines of tests for ~5.2k lines of
 library code):
 
 | Area | What is verified |
 |---|---|
 | Config (71) | type coercion incl. YAML `1e-4`, unknown-key errors with suggestions, every validation rule, overrides, round-trips |
-| Checkpointing (83) | safe loading (no arbitrary unpickling), lineage manifest as the commit point, rewinding a lineage durably, finding the newest checkpoint with only finite values, retention scoped to the lineage, a second writer is fenced off, corrupted vs. unreachable checkpoints, SHA-256 digests catch flipped bytes that `torch.load` accepts, atomic writes leave no partial files, failed writes keep the previous checkpoint, async saves return before the write and are isolated snapshots, FIFO order, backpressure, drain on close, failures surface once, retention across restarts, corrupted-checkpoint fallback, GCS/S3 against fakes |
+| Checkpointing (86) | safe loading (no arbitrary unpickling), digests computed in one pass while writing and equal to the SHA-256 of the stored file, lineage manifest as the commit point, rewinding a lineage durably, finding the newest checkpoint with only finite values, retention scoped to the lineage, a second writer is fenced off, corrupted vs. unreachable checkpoints, SHA-256 digests catch flipped bytes that `torch.load` accepts, atomic writes leave no partial files, failed writes keep the previous checkpoint, async saves return before the write and are isolated snapshots, FIFO order, backpressure, drain on close, failures surface once, retention across restarts, corrupted-checkpoint fallback, GCS/S3 against fakes |
 | Trainer (70) | divergence rollback (result bitwise identical to a run that never saw the skipped data, durable across a kill right after it, abandoned checkpoints never resumed from, NaN-weight checkpoints passed over, gives up after `max_rollbacks` in a row, works under the fp16 loss scaler and with DataLoader workers), `resume_path` applied once, changed hyperparameters refused, no silent restart from scratch, exact (bitwise) resume after a crash and after preemption, also with random augmentation in DataLoader workers, fp16 divergence guard, accumulation ≡ large batch, activation checkpointing ≡ none, divergence guard, LR schedules, checkpoint policy, eval, tracking |
 | Sampler / elastic / fault tolerance (68) | stop watchdog frees a rank blocked in C++, launcher exit codes and stop signals, agent stops when its launcher dies and does not start the job if the launcher died first, per-sample seeding independent of workers, world size and resume position, resume mid-epoch, re-sharding across world sizes without repeats or gaps, global-batch preservation, torchrun command construction, per-attempt rendezvous isolation, signal handling, launcher settles the status of dead runs |
 | API / CLI / tracking (42) | endpoints, stale-run detection, CLI commands end to end, crash-tolerant JSONL, atomic registry |

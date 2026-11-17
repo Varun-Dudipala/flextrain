@@ -1,0 +1,25 @@
+{
+  "what": "Background save time for one GPT-2 small + AdamW checkpoint (1493 MB) through CheckpointManager with async_save, comparing the write path before and after single-pass hashing, and a raw write of the same number of bytes as the floor.",
+  "method": "The arms alternate save by save (one of each per round) so that drift in the disk's speed affects all of them equally. 'previous' swaps in the old serialization step (torch.save, then read the whole file back to compute its SHA-256); 'current' hashes the bytes as torch.save writes them; 'raw' writes the same number of bytes from memory to a new file. Every arm ends with the same flush to disk (F_FULLFSYNC). Times are seconds per save, rounded to 0.01 as printed by the measuring script; the median throughputs were computed from the unrounded times.",
+  "environment": {
+    "machine": "Apple M3 laptop, 8 cores, 16 GB, internal SSD",
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "torch": "2.15.0",
+    "python": "3.11.12",
+    "date": "2026-11-17"
+  },
+  "checkpoint_mb": 1493,
+  "run_with_floor": {
+    "previous_seconds": [2.38, 3.17, 2.05, 1.9, 2.52, 2.72, 2.69],
+    "current_seconds": [1.35, 1.38, 1.53, 1.47, 2.34, 1.55, 1.5],
+    "raw_seconds": [0.93, 0.94, 1.48, 1.44, 1.28, 2.86, 1.9],
+    "median_mbps": {"previous": 592, "current": 994, "raw": 1036}
+  },
+  "earlier_run_without_floor": {
+    "previous_seconds": [1.96, 1.69, 2.65, 2.96, 3.43, 2.46, 4.89, 2.7],
+    "current_seconds": [1.22, 1.47, 2.74, 1.57, 2.0, 1.77, 1.94, 2.17],
+    "median_mbps": {"previous": 558, "current": 804},
+    "median_time_ratio_previous_over_current_per_adjacent_pair": 1.5
+  },
+  "caveat": "The same disk measured 290 MB/s raw later the same afternoon, after roughly 100 GB of benchmark writes and with other applications running; scripts/benchmark.py at that point reported saves at 265 MB/s, 87% of the floor. Absolute throughput on this laptop is a property of the disk's state; the ratio to the floor is the stable number."
+}
