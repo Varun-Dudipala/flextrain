@@ -83,7 +83,6 @@ class ElasticManager:
 
         self.accumulation_steps = training.accumulation_steps_for(world_size)
         self.global_batch = training.global_batch_for(world_size)
-        self.samples_per_rank_per_step = training.batch_size * self.accumulation_steps
         if training.global_batch_size is not None and self.global_batch != training.global_batch_size:
             logger.warning(
                 "global_batch_size=%d is not divisible by batch_size(%d) x world_size(%d); "

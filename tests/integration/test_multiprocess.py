@@ -18,77 +18,26 @@ from typing import Dict, List
 
 import pytest
 import torch
-import yaml
+
+from tests.integration.harness import (
+    DATASET_SIZE,
+    GLOBAL_BATCH,
+    TOY_SCRIPT,
+    expected_permutation,
+    job_env,
+    launch_cmd,
+    process_alive,
+    results,
+    run_job,
+    step_samples,
+    write_config,
+)
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
                        reason="requires torch.distributed with gloo"),
 ]
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-TOY_SCRIPT = Path(__file__).with_name("toy_train.py")
-DATASET_SIZE = 96  # must match IndexedDataset in toy_train.py
-GLOBAL_BATCH = 8
-SEED = 42
-
-
-def write_config(tmp: Path, **overrides) -> Path:
-    cfg = {
-        "main": {"experiment_name": "toy", "output_dir": str(tmp / "outputs"), "seed": SEED, "log_to_file": False},
-        "training": {"batch_size": 4, "global_batch_size": GLOBAL_BATCH, "learning_rate": 0.05, "max_steps": 12,
-                     "log_interval": 1, "num_workers": 0, "optimizer": "adamw"},
-        "distributed": {"backend": "gloo", "device": "cpu", "timeout_minutes": 2},
-        "checkpoint": {"save_interval_steps": 5, "keep_last_n": 10},
-        "elastic": {"max_restarts": 0, "monitor_interval": 0.5},
-    }
-    for dotted, value in overrides.items():
-        section, key = dotted.split("__")
-        cfg[section][key] = value
-    path = tmp / "config.yaml"
-    path.write_text(yaml.safe_dump(cfg))
-    return path
-
-
-def launch_cmd(config: Path, nproc: int, max_restarts: int = 0) -> List[str]:
-    return [sys.executable, "-m", "flextrain.cli.main", "launch", "-c", str(config),
-            "--nproc-per-node", str(nproc), "--max-restarts", str(max_restarts), str(TOY_SCRIPT)]
-
-
-def job_env(tmp: Path, out: Path, **extra: str) -> Dict[str, str]:
-    env = dict(os.environ)
-    env.update(FLEXTRAIN_HOME=str(tmp / "home"), FT_OUT=str(out), PYTHONPATH=str(REPO_ROOT),
-               MASTER_ADDR="127.0.0.1", OMP_NUM_THREADS="1", **extra)
-    return env
-
-
-def run_job(config: Path, tmp: Path, out: Path, nproc: int, max_restarts: int = 0, **extra: str):
-    proc = subprocess.run(launch_cmd(config, nproc, max_restarts), env=job_env(tmp, out, **extra),
-                          capture_output=True, text=True, timeout=180)
-    return proc
-
-
-def results(out: Path) -> Dict[int, dict]:
-    return {int(p.stem.split("rank")[1]): json.loads(p.read_text()) for p in out.glob("result_rank*.json")}
-
-
-def step_samples(out_dirs: List[Path]) -> Dict[int, List[int]]:
-    """step -> sample indices, keeping each step's entries from the *latest* run that logged it."""
-    by_step: Dict[int, List[int]] = {}
-    for out in out_dirs:  # later directories (later incarnations) override earlier ones
-        current: Dict[int, List[int]] = {}
-        for log in out.glob("samples_rank*.jsonl"):
-            for line in log.read_text().splitlines():
-                rec = json.loads(line)
-                current.setdefault(rec["step"], []).extend(rec["idx"])
-        by_step.update(current)
-    return by_step
-
-
-def expected_permutation(epoch: int = 0) -> List[int]:
-    g = torch.Generator()
-    g.manual_seed(SEED + epoch)
-    return torch.randperm(DATASET_SIZE, generator=g).tolist()
 
 
 def assert_ok(proc: subprocess.CompletedProcess) -> None:
@@ -150,9 +99,24 @@ def test_crash_without_restarts_fails_the_job(tmp_path):
     assert proc.returncode != 0
     ckpts = sorted(p.name for p in (tmp_path / "outputs" / "toy" / "checkpoints").glob("*.pt"))
     assert ckpts == ["checkpoint_step00000005.pt"]
-    # Rank 0 owns the registry record; it fails when its peer disappears mid-collective.
+    # Rank 0 owns the registry record. Where the collective errors out when the peer disappears
+    # (Linux) it records its own failure; where it stays blocked until the agent SIGKILLs it
+    # (macOS) the launcher records the failure instead. Either way the run must not say "running".
     registry = json.loads(next((tmp_path / "home" / "runs").glob("*.json")).read_text())
     assert registry["status"] == "failed" and registry.get("error")
+
+
+def test_checkpoint_write_failure_on_rank_0_stops_every_rank_together(tmp_path):
+    """Only rank 0 touches storage. When its writes fail, the other ranks must be told - otherwise
+    they carry on into the next collective without rank 0 and sit there until a timeout."""
+    out = tmp_path / "out"
+    proc = run_job(write_config(tmp_path), tmp_path, out, nproc=2, FT_FAIL_SAVE_AT_STEP="5")
+    assert proc.returncode != 0
+    assert "injected failure: no space left on device" in proc.stderr  # rank 0: the real error
+    assert "failed on another rank" in proc.stderr  # rank 1: stopped by agreement, not by a timeout
+    assert not list((tmp_path / "outputs" / "toy" / "checkpoints").glob("*.pt"))
+    registry = json.loads(next((tmp_path / "home" / "runs").glob("*.json")).read_text())
+    assert registry["status"] == "failed" and registry.get("last_checkpoint") is None
 
 
 def test_sigterm_to_one_rank_stops_all_ranks_at_the_same_step(tmp_path):
@@ -161,8 +125,8 @@ def test_sigterm_to_one_rank_stops_all_ranks_at_the_same_step(tmp_path):
     proc = subprocess.Popen(launch_cmd(config, nproc=2), env=job_env(tmp_path, out, FT_STEP_SLEEP="0.05"),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        deadline = time.time() + 120
-        while time.time() < deadline:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
             steps = step_samples([out])
             if (out / "pid_rank1").exists() and steps and max(steps) >= 5:
                 break
@@ -184,6 +148,108 @@ def test_sigterm_to_one_rank_stops_all_ranks_at_the_same_step(tmp_path):
     assert ckpt.exists(), "a consistent checkpoint must be written at the agreed stop step"
     registry = json.loads(next((tmp_path / "home" / "runs").glob("*.json")).read_text())
     assert registry["status"] == "preempted"
+
+
+def wait_for_step(out: Path, step: int, timeout: float = 120) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        steps = step_samples([out])
+        if (out / "pid_rank1").exists() and steps and max(steps) >= step:
+            return
+        time.sleep(0.2)
+    pytest.fail(f"job did not reach step {step}")
+
+
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGINT"])
+def test_stop_signal_to_the_launcher_stops_the_whole_job_cleanly(tmp_path, signame):
+    """A scheduler (SIGTERM) or a terminal (Ctrl-C) signals `flextrain launch`, not the workers.
+    The launcher must pass it on: every rank stops after the same step, one checkpoint is
+    written, and no process is left behind."""
+    out = tmp_path / "out"
+    config = write_config(tmp_path, training__max_steps=100_000, checkpoint__save_interval_steps=0)
+    proc = subprocess.Popen(launch_cmd(config, nproc=2), env=job_env(tmp_path, out, FT_STEP_SLEEP="0.05"),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        wait_for_step(out, 5)
+        worker_pids = [int((out / f"pid_rank{r}").read_text()) for r in (0, 1)]
+        os.kill(proc.pid, getattr(signal, signame))  # the launcher only
+        proc.communicate(timeout=120)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 0, "a job that stopped on request with a checkpoint is not a failure"
+    res = results(out)
+    assert res[0]["status"] == res[1]["status"] == "preempted"
+    assert res[0]["step"] == res[1]["step"] >= 5
+    ckpt = tmp_path / "outputs" / "toy" / "checkpoints" / f"checkpoint_step{res[0]['step']:08d}.pt"
+    assert ckpt.exists(), "a consistent checkpoint must be written at the agreed stop step"
+    registry = json.loads(next((tmp_path / "home" / "runs").glob("*.json")).read_text())
+    assert registry["status"] == "preempted"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and any(process_alive(pid) for pid in worker_pids):
+        time.sleep(0.2)
+    assert not any(process_alive(pid) for pid in worker_pids), "workers outlived the launcher"
+
+
+def test_killing_the_launcher_stops_the_job_instead_of_orphaning_it(tmp_path):
+    """SIGKILL cannot be forwarded - the launcher is simply gone. The agent runs in its own
+    session, so without a watch on its parent it would keep the workers alive (and keep
+    restarting them) with nothing left to stop it. It must notice, and stop them cleanly."""
+    out = tmp_path / "out"
+    config = write_config(tmp_path, training__max_steps=100_000, checkpoint__save_interval_steps=0)
+    proc = subprocess.Popen(launch_cmd(config, nproc=2, max_restarts=3),
+                            env=job_env(tmp_path, out, FT_STEP_SLEEP="0.05"),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    worker_pids = []
+    try:
+        wait_for_step(out, 5)
+        worker_pids = [int((out / f"pid_rank{r}").read_text()) for r in (0, 1)]
+        proc.kill()
+        proc.wait()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and any(process_alive(pid) for pid in worker_pids):
+            time.sleep(0.2)
+        assert not any(process_alive(pid) for pid in worker_pids), "workers outlived a killed launcher"
+    finally:
+        for pid in worker_pids:
+            if process_alive(pid):
+                os.kill(pid, signal.SIGKILL)
+    res = results(out)
+    assert res[0]["status"] == res[1]["status"] == "preempted" and res[0]["step"] == res[1]["step"]
+    registry = json.loads(next((tmp_path / "home" / "runs").glob("*.json")).read_text())
+    assert registry["status"] == "preempted" and registry["last_checkpoint_step"] == res[0]["step"]
+
+
+def test_hung_worker_times_out_and_the_job_recovers(tmp_path):
+    """Freeze one rank (SIGSTOP: alive, but silent - like a deadlock or a dead NIC). Its peer's
+    collective must time out instead of waiting forever, and the elastic agent must then restart
+    the group, which resumes from the last checkpoint and finishes."""
+    out = tmp_path / "out"
+    config = write_config(tmp_path, training__max_steps=120, distributed__timeout_minutes=0.25)
+    proc = subprocess.Popen(launch_cmd(config, nproc=2, max_restarts=1),
+                            env=job_env(tmp_path, out, FT_STEP_SLEEP="0.05"),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    frozen = None
+    try:
+        wait_for_step(out, 8)  # past the first checkpoint (step 5)
+        frozen = int((out / "pid_rank1").read_text())
+        os.kill(frozen, signal.SIGSTOP)
+        frozen_at = time.monotonic()
+        stdout, stderr = proc.communicate(timeout=170)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        if frozen is not None and process_alive(frozen):
+            os.kill(frozen, signal.SIGKILL)
+    assert proc.returncode == 0, stderr[-4000:]
+    assert time.monotonic() - frozen_at > 15, "the job cannot have recovered before the 15 s collective timeout"
+    res = results(out)
+    assert res[0]["restart"] == 1, "the worker group should have been restarted once"
+    assert res[0]["status"] == res[1]["status"] == "completed" and res[0]["step"] == 120
+    assert "checkpoint_step" in res[0]["resumed_from"]
+    assert res[0]["digest"] == res[1]["digest"]
+    registry = json.loads(next((tmp_path / "home" / "runs").glob("*.json")).read_text())
+    assert registry["status"] == "completed" and registry["restart_count"] == 1
 
 
 def test_elastic_resize_resumes_from_exact_global_data_position(baseline, tmp_path):

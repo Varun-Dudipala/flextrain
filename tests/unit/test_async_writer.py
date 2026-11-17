@@ -71,6 +71,25 @@ def test_writes_complete_in_submission_order(tmp_path):
     assert storage.order == [0, 1, 2, 3]
 
 
+def test_each_in_flight_save_keeps_its_own_snapshot(tmp_path):
+    """With several saves in flight each needs its own host buffers. If two shared one, an earlier
+    queued checkpoint would be written with a later step's weights - silently."""
+    storage = GatedStorage()
+    writer = AsyncCheckpointWriter(storage, max_pending=3)
+    live = torch.zeros(1000)
+    for step in range(3):
+        live.fill_(float(step))  # training keeps overwriting the same tensor between saves
+        writer.submit({"step": step, "w": live}, str(tmp_path / f"{step}.pt"))
+    storage.gate.set()
+    writer.wait()
+    for step in range(3, 6):  # a second lap around the ring, now reusing the buffers
+        live.fill_(float(step))
+        writer.submit({"step": step, "w": live}, str(tmp_path / f"{step}.pt"))
+    writer.close()
+    for step in range(6):
+        assert torch.equal(torch.load(tmp_path / f"{step}.pt")["w"], torch.full((1000,), float(step))), step
+
+
 def test_backpressure_blocks_when_max_pending_reached(tmp_path):
     storage = GatedStorage()
     writer = AsyncCheckpointWriter(storage, max_pending=1)

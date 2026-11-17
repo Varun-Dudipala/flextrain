@@ -1,6 +1,6 @@
 """Core training module."""
 
-from .data_loader import ResumableDistributedSampler, build_dataloader
+from .data_loader import ResumableDistributedSampler, SeededDataset, build_dataloader
 from .ddp_wrapper import DDPWrapper
 from .distributed import DistContext, destroy_distributed, init_distributed
 from .fsdp_wrapper import FSDPWrapper
@@ -16,5 +16,6 @@ __all__ = [
     "init_distributed",
     "destroy_distributed",
     "ResumableDistributedSampler",
+    "SeededDataset",
     "build_dataloader",
 ]

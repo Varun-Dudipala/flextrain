@@ -1,5 +1,5 @@
 # Runtime dependencies (mirrors pyproject.toml). For development: pip install -e ".[dev]"
-torch>=2.3
+torch>=2.5
 pyyaml>=6.0
 typer>=0.9.0
 rich>=13.0.0

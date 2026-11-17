@@ -56,11 +56,12 @@ def capture_optimizer_state(model: nn.Module, optimizer: torch.optim.Optimizer) 
 
 
 def restore_model_state(model: nn.Module, state: Dict[str, Any], strict: bool = True) -> Any:
-    return set_model_state_dict(model, state, options=_load_options(strict))
+    return set_model_state_dict(model, model_state_dict=state, options=_load_options(strict))
 
 
 def restore_optimizer_state(model: nn.Module, optimizer: torch.optim.Optimizer, state: Dict[str, Any]) -> None:
-    set_optimizer_state_dict(model, optimizer, state, options=_load_options())
+    # optim_state_dict by keyword: it is keyword-only in torch 2.3 and positional in later versions.
+    set_optimizer_state_dict(model, optimizer, optim_state_dict=state, options=_load_options())
 
 
 def capture_state(
@@ -97,7 +98,10 @@ def capture_rng_state() -> Dict[str, Any]:
     try:
         import numpy as np
 
-        state["numpy"] = np.random.get_state()
+        # As plain lists, not an ndarray: checkpoints then hold only tensors and builtin
+        # containers and can be loaded without unpickling arbitrary objects.
+        kind, keys, pos, has_gauss, cached_gaussian = np.random.get_state()
+        state["numpy"] = [kind, keys.tolist(), int(pos), int(has_gauss), float(cached_gaussian)]
     except ImportError:  # pragma: no cover
         pass
     if torch.cuda.is_available() and torch.cuda.is_initialized():
@@ -112,7 +116,8 @@ def restore_rng_state(state: Dict[str, Any]) -> None:
         try:
             import numpy as np
 
-            np.random.set_state(state["numpy"])
+            kind, keys, pos, has_gauss, cached_gaussian = state["numpy"]
+            np.random.set_state((kind, np.asarray(keys, dtype=np.uint32), pos, has_gauss, cached_gaussian))
         except ImportError:  # pragma: no cover
             pass
     if "cuda" in state and torch.cuda.is_available():

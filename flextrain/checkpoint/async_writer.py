@@ -25,6 +25,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, Optional
 
+from .manifest import CheckpointConflictError
 from .snapshot import SnapshotBuffers
 from .storage import StorageBackend
 
@@ -53,6 +54,8 @@ def _save_with_retries(storage: StorageBackend, state: Dict[str, Any], path: str
     for attempt in range(retries + 1):
         try:
             return storage.save(state, path)
+        except CheckpointConflictError:
+            raise  # another writer owns the directory: retrying would only interleave with it
         except Exception as e:
             if attempt == retries:
                 raise
@@ -154,10 +157,6 @@ class AsyncCheckpointWriter:
             buffers.release()
         if raise_errors:
             self.raise_if_failed()
-
-    @property
-    def host_buffer_bytes(self) -> int:
-        return sum(b.nbytes for b in self._ring)
 
     # ------------------------------------------------------------------ worker side
     def _write(self, snapshot, path, on_success, snapshot_seconds) -> SaveRecord:

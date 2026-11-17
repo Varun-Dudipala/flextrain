@@ -101,7 +101,7 @@ class TestValidation:
             CheckpointConfig(**kwargs)
 
     @pytest.mark.parametrize("kwargs", [{"min_nodes": 0}, {"min_nodes": 4, "max_nodes": 2},
-                                        {"rdzv_endpoint": "nohost"}, {"max_restarts": -1}])
+                                        {"rdzv_endpoint": "nohost"}, {"max_restarts": -1}, {"shutdown_timeout": 0}])
     def test_elastic_rejects(self, kwargs):
         with pytest.raises(ConfigError):
             ElasticConfig(**kwargs)
@@ -109,6 +109,24 @@ class TestValidation:
     def test_fault_tolerance_rejects_unknown_signal(self):
         with pytest.raises(ConfigError, match="SIGFOO"):
             FaultToleranceConfig(signals=["SIGFOO"])
+
+    @pytest.mark.parametrize("name", ["SIGKILL", "SIGSTOP"])
+    def test_fault_tolerance_rejects_signals_that_cannot_be_caught(self, name):
+        with pytest.raises(ConfigError, match="cannot be caught"):
+            FaultToleranceConfig(signals=[name])
+
+    @pytest.mark.parametrize("name", [".", ".."])
+    def test_names_cannot_be_dot_directories(self, name):
+        with pytest.raises(ConfigError, match="directory name"):
+            Config.from_dict({"main": {"experiment_name": name}})
+        with pytest.raises(ConfigError, match="directory name"):
+            Config.from_dict({"main": {"run_name": name}})
+
+    def test_stop_grace_period(self):
+        assert FaultToleranceConfig().stop_grace_seconds == 15.0
+        assert FaultToleranceConfig(stop_grace_seconds=None).stop_grace_seconds is None  # watchdog off
+        with pytest.raises(ConfigError, match="stop_grace_seconds"):
+            FaultToleranceConfig(stop_grace_seconds=0)
 
     def test_run_name_cannot_escape_output_dir(self):
         with pytest.raises(ConfigError):
@@ -197,6 +215,12 @@ class TestOverrides:
         monkeypatch.setenv("FLEXTRAIN_OVERRIDES", "training.batch_size=16\ntraining.max_steps=5")
         cfg = load_config(overrides=["training.max_steps=7"])
         assert cfg.training.batch_size == 16 and cfg.training.max_steps == 7
+
+    def test_launch_overrides_without_a_config_file_apply_to_defaults(self, monkeypatch):
+        """`flextrain launch --set ...` with no `-c`: workers must still get a config."""
+        monkeypatch.setenv("FLEXTRAIN_OVERRIDES", "training.max_steps=5")
+        cfg = load_config()
+        assert cfg.training.max_steps == 5 and cfg.training.batch_size == 32
 
     def test_load_config_without_path_or_env(self):
         with pytest.raises(ConfigError, match="FLEXTRAIN_CONFIG"):

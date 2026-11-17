@@ -21,12 +21,19 @@ jobs:
       - run: ruff check .
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12"]
+        include:
+          # macOS differs from Linux in what the unit tests touch: flushing to disk, signal
+          # delivery, and starting DataLoader workers with spawn. The multi-process tests are
+          # skipped on it, see the step below.
+          - os: macos-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,9 +42,39 @@ jobs:
           cache: pip
       - name: Install (CPU-only PyTorch)
         run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            pip install torch --index-url https://download.pytorch.org/whl/cpu  # skip the CUDA wheels
+          fi
           pip install -e ".[dev]"
       - name: Unit tests
         run: pytest -m "not integration" -q --cov=flextrain --cov-report=term-missing:skip-covered
+      - name: Multi-process integration tests (torchrun, gloo)
+        # Run even after a unit failure, so one does not hide the other. Linux only: on GitHub's
+        # macOS runner every reverse lookup of a loopback address takes 35 s, and torchrun and
+        # TCPStore do one in each process they start, so a launch that takes 10 s on a real Mac
+        # takes minutes there and every test times out. On macOS these tests are run locally
+        # (`pytest -m integration`, `make chaos`).
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: pytest -m integration -q
+
+  min-torch:
+    # The oldest PyTorch the package declares support for (pyproject.toml). Older releases fail:
+    # 2.3 does not restore state exactly through torch.distributed.checkpoint.state_dict, and
+    # 2.4 ignores torchrun's --local-addr when each restart gets a fresh rendezvous store.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install PyTorch 2.5.0 (CPU)
+        run: |
+          pip install "torch==2.5.0" "numpy<2" --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+          pip install -e ".[dev]" "numpy<2"
+          python -c "import torch; assert torch.__version__.startswith('2.5.0'), torch.__version__"
+      - name: Unit tests
+        run: pytest -m "not integration" -q
       - name: Multi-process integration tests (torchrun, gloo)
         run: pytest -m integration -q

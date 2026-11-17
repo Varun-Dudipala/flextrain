@@ -48,6 +48,10 @@ class TrainingConfig(BaseConfig):
     # Data loading
     num_workers: int = 2
     pin_memory: bool = True
+    # Seed dataset / collate randomness from (seed, epoch, sample index), so augmentation is
+    # identical whatever the number of workers or ranks and wherever a resumed run restarts.
+    # Without it, exact resume holds only for num_workers=0 or datasets without randomness.
+    seed_per_sample: bool = True
 
     # Logging / evaluation (eval_interval == 0 disables periodic evaluation)
     log_interval: int = 10

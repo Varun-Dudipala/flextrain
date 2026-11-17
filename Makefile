@@ -1,4 +1,4 @@
-.PHONY: install lint test test-unit test-integration bench demo
+.PHONY: install lint test test-unit test-integration chaos bench demo
 
 install:  ## editable install with dev tools (CPU wheels work fine)
 	pip install -e ".[dev]"
@@ -14,6 +14,9 @@ test-unit:
 
 test-integration:
 	pytest -q -m integration
+
+chaos:  ## randomized fault injection: SIGKILL random ranks, require a bitwise-identical result
+	python -m tests.integration.chaos --trials 50 --max-kills 3 --output chaos_results.json
 
 bench:  ## checkpoint + training-overhead benchmark (GPU if available)
 	python scripts/benchmark.py --output benchmark_results.json

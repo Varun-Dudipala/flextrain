@@ -8,7 +8,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from flextrain.checkpoint import CheckpointManager, CheckpointSaveError, LocalStorage, validate_checkpoint
+from flextrain.checkpoint import (
+    CheckpointConflictError,
+    CheckpointManager,
+    CheckpointSaveError,
+    LocalStorage,
+    NoUsableCheckpointError,
+    validate_checkpoint,
+)
 from flextrain.config import CheckpointConfig
 
 
@@ -128,6 +135,221 @@ def test_corrupted_latest_falls_back_to_previous(tmp_path, caplog):
     assert "Skipping unusable checkpoint" in caplog.text
 
 
+def test_bit_rot_in_latest_falls_back_to_previous(tmp_path, caplog):
+    """A flipped byte in the weights still unpickles; only the digest catches it."""
+    model = SimpleModel()
+    with manager(tmp_path, async_save=False) as mgr:
+        mgr.save(model, step=1)
+        latest = Path(mgr.save(model, step=2))
+        raw = bytearray(latest.read_bytes())
+        offset = bytes(raw).find(model.fc1.weight.detach().numpy().tobytes())
+        assert offset > 0
+        raw[offset] ^= 0xFF
+        latest.write_bytes(raw)
+        with caplog.at_level(logging.WARNING):
+            meta = mgr.try_load_latest(model)
+    assert meta["step"] == 1
+    assert "checksum mismatch" in caplog.text
+
+
+def test_truncated_checkpoint_without_a_digest_still_falls_back(tmp_path):
+    """The path that existed before digests: nothing to compare against, the bytes just do not load."""
+    model = SimpleModel()
+    with manager(tmp_path, async_save=False) as mgr:
+        mgr.save(model, step=1)
+        latest = Path(mgr.save(model, step=2))
+        Path(str(latest) + ".sha256").unlink()
+        latest.write_bytes(latest.read_bytes()[:200])
+        assert mgr.try_load_latest(model)["step"] == 1
+
+
+def test_pruning_removes_digest_files_too(tmp_path):
+    model = SimpleModel()
+    with manager(tmp_path, async_save=False, keep_last_n=1) as mgr:
+        for step in range(1, 4):
+            mgr.save(model, step=step)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["checkpoint_step00000003.pt",
+                                                          "checkpoint_step00000003.pt.sha256", "manifest.json"]
+
+
+def test_checksum_config_disables_digests(tmp_path):
+    with manager(tmp_path, async_save=False, checksum=False) as mgr:
+        mgr.save(SimpleModel(), step=1)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["checkpoint_step00000001.pt", "manifest.json"]
+
+
+def corrupt(path):
+    Path(path).write_bytes(Path(path).read_bytes()[:200])
+
+
+class TestLineage:
+    """A directory plus a step number is not an identity; the manifest's lineage is."""
+
+    def test_new_lineage_is_not_crowded_out_by_an_older_runs_higher_steps(self, tmp_path):
+        """Step-based retention used to delete a new run's checkpoints the moment they were written,
+        because an earlier run in the same directory had got further."""
+        model = SimpleModel()
+        with manager(tmp_path, async_save=False, keep_last_n=3) as old:
+            for step in (16, 18, 20):
+                old.save(model, step=step)
+        with manager(tmp_path, async_save=False, keep_last_n=1) as new:
+            new.open_lineage()
+            new.save(model, step=2)
+            path = new.save(model, step=4)
+            assert Path(path).exists() and new.latest_checkpoint() == path
+            assert [c.step for c in new.committed_checkpoints()] == [4]
+        # its own step 2 was pruned; the earlier run's files were never touched
+        assert names(tmp_path) == [f"checkpoint_step{s:08d}.pt" for s in (4, 16, 18, 20)]
+
+    def test_continuing_from_an_older_checkpoint_drops_the_abandoned_future(self, tmp_path):
+        """Fall back from a corrupted step 20 to step 10, then save step 13. Keeping the 'highest
+        step' would keep the corrupted 20 and prune 13, leaving nothing usable."""
+        model = SimpleModel()
+        with manager(tmp_path, async_save=False, keep_last_n=2) as first:
+            first.save(model, step=10)
+            corrupt(first.save(model, step=20))
+        with manager(tmp_path, async_save=False, keep_last_n=1) as second:
+            assert second.load_latest_state()[1]["step"] == 10
+            second.save(model, step=13)
+            assert [c.step for c in second.committed_checkpoints()] == [13]
+        with manager(tmp_path, async_save=False) as third:
+            assert third.load_latest_state()[1]["step"] == 13
+
+    def test_a_file_is_not_a_checkpoint_until_it_is_committed(self, tmp_path):
+        """Writer dies after the checkpoint file is durable but before the manifest names it."""
+        model = SimpleModel()
+
+        class DiesBeforeCommit(LocalStorage):
+            def write_bytes(self, path, data):
+                if Path(path).name == "manifest.json" and b'"step": 2' in data:
+                    raise OSError("killed before the commit")
+                super().write_bytes(path, data)
+
+        mgr = manager(tmp_path, async_save=False, storage=DiesBeforeCommit())
+        mgr.write_retries = 0
+        mgr.save(model, step=1)
+        with pytest.raises(OSError, match="killed before the commit"):
+            mgr.save(model, step=2)
+        assert (tmp_path / "checkpoint_step00000002.pt").exists()
+        with manager(tmp_path, async_save=False) as after:
+            assert [c.step for c in after.committed_checkpoints()] == [1]
+            assert after.load_latest_state()[1]["step"] == 1
+
+    @pytest.mark.parametrize("async_save", [False, True])
+    def test_a_second_writer_fences_the_first_one_off(self, tmp_path, async_save):
+        model = SimpleModel()
+        a = manager(tmp_path, async_save=async_save)
+        b = manager(tmp_path, async_save=False)
+        a.save(model, step=1, blocking=True)
+        b.save(model, step=2)  # takes the directory over
+        with pytest.raises((CheckpointConflictError, CheckpointSaveError), match="another process"):
+            a.save(model, step=3, blocking=True)
+        assert [c.step for c in b.committed_checkpoints()] == [1, 2]
+        a.close(raise_errors=False)
+        b.close()
+
+    def test_directory_without_a_manifest_is_adopted(self, tmp_path):
+        """Checkpoints written before manifests existed keep working, including retention."""
+        model = SimpleModel()
+        with manager(tmp_path, async_save=False) as old:
+            for step in (1, 2, 3):
+                old.save(model, step=step)
+        (tmp_path / "manifest.json").unlink()
+        with manager(tmp_path, async_save=False, keep_last_n=2) as new:
+            assert new.load_latest_state()[1]["step"] == 3
+            new.save(model, step=4)
+            assert [c.step for c in new.committed_checkpoints()] == [3, 4]
+        assert names(tmp_path) == ["checkpoint_step00000003.pt", "checkpoint_step00000004.pt"]
+
+    def test_unreadable_manifest_falls_back_to_the_directory_listing(self, tmp_path, caplog):
+        model = SimpleModel()
+        with manager(tmp_path, async_save=False) as mgr:
+            mgr.save(model, step=1)
+        (tmp_path / "manifest.json").write_text("{ not json")
+        with manager(tmp_path, async_save=False) as mgr, caplog.at_level(logging.ERROR):
+            assert mgr.load_latest_state()[1]["step"] == 1
+        assert "falling back to the directory listing" in caplog.text
+
+
+class TestLoadFailures:
+    """Corrupted checkpoints are skipped. Unreachable ones are not, and 'none usable' is not 'none'."""
+
+    def test_every_checkpoint_corrupted_is_an_error_not_a_fresh_start(self, tmp_path):
+        model = SimpleModel()
+        with manager(tmp_path, async_save=False) as mgr:
+            corrupt(mgr.save(model, step=1))
+            corrupt(mgr.save(model, step=2))
+        with manager(tmp_path, async_save=False) as mgr:
+            with pytest.raises(NoUsableCheckpointError, match="Refusing to silently start from step 0"):
+                mgr.load_latest_state()
+            with pytest.raises(NoUsableCheckpointError):
+                mgr.try_load_latest(model)
+        assert len(names(tmp_path)) == 2  # nothing was deleted
+
+    def test_storage_errors_are_retried_then_raised_never_skipped(self, tmp_path, monkeypatch):
+        import time
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        model = SimpleModel()
+        with manager(tmp_path, async_save=False) as mgr:
+            mgr.save(model, step=1)
+            mgr.save(model, step=2)
+
+        class Unreachable(LocalStorage):
+            attempts = 0
+
+            def load(self, path):
+                Unreachable.attempts += 1
+                raise OSError("stale NFS file handle")
+
+        with manager(tmp_path, async_save=False, storage=Unreachable()) as mgr:
+            with pytest.raises(OSError, match="stale NFS"):
+                mgr.load_latest_state()
+        assert Unreachable.attempts == 3  # the newest checkpoint, tried 1 + 2 times; older ones not consulted
+
+    def test_transient_storage_error_recovers(self, tmp_path, monkeypatch):
+        import time
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        model = SimpleModel()
+        with manager(tmp_path, async_save=False) as mgr:
+            mgr.save(model, step=7)
+
+        class Flaky(LocalStorage):
+            failures = 2
+
+            def load(self, path):
+                if Flaky.failures:
+                    Flaky.failures -= 1
+                    raise OSError("throttled")
+                return super().load(path)
+
+        with manager(tmp_path, async_save=False, storage=Flaky()) as mgr:
+            assert mgr.load_latest_state()[1]["step"] == 7
+
+    def test_untrusted_checkpoint_stops_the_resume_instead_of_falling_back(self, tmp_path):
+        """Skipping it would quietly resume an older checkpoint and discard the newer work."""
+        from flextrain.checkpoint import UntrustedCheckpointError
+
+        model = SimpleModel()
+        with manager(tmp_path, async_save=False) as mgr:
+            mgr.save(model, step=1)
+            mgr.save(model, step=2, extra={"hook": threading.Event})  # a class reference: needs real unpickling
+        with manager(tmp_path, async_save=False) as mgr:
+            with pytest.raises(UntrustedCheckpointError):
+                mgr.load_latest_state()
+        with manager(tmp_path, async_save=False, allow_pickle=True) as mgr:
+            assert mgr.load_latest_state()[1]["step"] == 2
+
+    def test_missing_file_named_by_the_manifest_is_skipped(self, tmp_path):
+        model = SimpleModel()
+        with manager(tmp_path, async_save=False) as mgr:
+            mgr.save(model, step=1)
+            Path(mgr.save(model, step=2)).unlink()
+        with manager(tmp_path, async_save=False) as mgr:
+            assert mgr.load_latest_state()[1]["step"] == 1
+
+
 def test_non_flextrain_file_is_skipped(tmp_path):
     model = SimpleModel()
     with manager(tmp_path, async_save=False) as mgr:
@@ -145,6 +367,7 @@ def test_try_load_latest_empty(tmp_path):
 
 def test_stale_temp_files_are_cleaned_up(tmp_path):
     (tmp_path / ".checkpoint_step00000007.pt.deadbeef.tmp").write_bytes(b"partial")
+    (tmp_path / ".checkpoint_step00000007.pt.sha256.deadbeef.tmp").write_bytes(b"partial digest")
     (tmp_path / "unrelated.tmp").write_bytes(b"keep me")
     manager(tmp_path, async_save=False).close()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["unrelated.tmp"]

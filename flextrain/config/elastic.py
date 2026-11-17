@@ -30,6 +30,12 @@ class ElasticConfig(BaseConfig):
 
     max_restarts: int = 3
     monitor_interval: float = 5.0  # seconds between agent health checks of local workers
+    # How long the agent waits, after a stop request reaches it, between telling the workers to
+    # stop (SIGTERM) and killing them (SIGKILL). This is the window a preempted job has to finish
+    # its step and write a blocking checkpoint, so it must cover that save; torchrun's own default
+    # is 30. (After a *worker failure* torchrun always waits 30 s for the surviving workers; see
+    # fault_tolerance.stop_grace_seconds for what shortens that.)
+    shutdown_timeout: int = 60
 
     @classmethod
     def section_name(cls) -> str:
@@ -41,14 +47,12 @@ class ElasticConfig(BaseConfig):
         _require(self.nproc_per_node >= 1, "elastic.nproc_per_node must be >= 1")
         _require(self.max_restarts >= 0, "elastic.max_restarts must be >= 0")
         _require(self.monitor_interval > 0, "elastic.monitor_interval must be positive")
+        _require(self.shutdown_timeout >= 1, "elastic.shutdown_timeout must be >= 1")
         if self.rdzv_endpoint is not None:
             host, sep, port = self.rdzv_endpoint.rpartition(":")
             _require(bool(sep and host and port.isdigit()),
                      f"elastic.rdzv_endpoint must look like host:port, got {self.rdzv_endpoint!r}")
 
-    @property
-    def is_multi_node(self) -> bool:
-        return self.max_nodes > 1
 
 
 @dataclass
@@ -63,6 +67,11 @@ class FaultToleranceConfig(BaseConfig):
     # How often (in optimizer steps) ranks agree on stop / time-based-save decisions.
     # Costs one tiny all-reduce per check.
     stop_check_interval: int = 1
+    # After a stop signal, a rank that neither makes progress (finishes a micro-batch) nor
+    # reaches the agreed stop within this many seconds is taken to be blocked on a dead or hung
+    # peer and exits at once, instead of sitting out the agent's whole shutdown timeout. Raise it
+    # if a single micro-batch can take longer; null disables the watchdog.
+    stop_grace_seconds: Optional[float] = 15.0
 
     # Divergence guard: an optimizer step with a non-finite gradient norm is skipped.
     # More than ``max_consecutive_nonfinite`` skipped steps in a row raises, which lets
@@ -79,5 +88,9 @@ class FaultToleranceConfig(BaseConfig):
         for name in self.signals:
             _require(isinstance(getattr(signal, name, None), signal.Signals),
                      f"fault_tolerance.signals: unknown signal {name!r}")
+            _require(name not in ("SIGKILL", "SIGSTOP"),
+                     f"fault_tolerance.signals: {name} cannot be caught, so it cannot request a graceful stop")
         _require(self.stop_check_interval >= 1, "fault_tolerance.stop_check_interval must be >= 1")
+        if self.stop_grace_seconds is not None:
+            _require(self.stop_grace_seconds > 0, "fault_tolerance.stop_grace_seconds must be positive (or null)")
         _require(self.max_consecutive_nonfinite >= 1, "fault_tolerance.max_consecutive_nonfinite must be >= 1")

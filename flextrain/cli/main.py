@@ -60,7 +60,8 @@ def launch(
     typer.echo(env_prefix + shlex.join(cmd))
     if dry_run:
         return
-    raise typer.Exit(run_cmd(cmd, config_path=str(config) if config else None, overrides=overrides))
+    raise typer.Exit(run_cmd(cmd, config_path=str(config) if config else None, overrides=overrides,
+                             shutdown_timeout=cfg.elastic.shutdown_timeout))
 
 
 @app.command()
@@ -108,12 +109,12 @@ def status(
     from rich.console import Console
     from rich.table import Table
 
-    from flextrain.api.server import _with_liveness
+    from flextrain.api.server import with_liveness
     from flextrain.tracking import RUNNING, RunRegistry
 
     runs = RunRegistry(home).list()
     host = __import__("socket").gethostname()
-    runs = [_with_liveness(r, host) for r in runs]
+    runs = [with_liveness(r, host) for r in runs]
     if not all_runs:
         runs = [r for r in runs if r.get("status") == RUNNING]
     if not runs:
@@ -137,13 +138,29 @@ def status(
 
 
 @app.command()
-def inspect(path: Path = typer.Argument(..., help="Checkpoint file")):
+def inspect(path: Path = typer.Argument(..., help="Checkpoint file"),
+            allow_pickle: bool = typer.Option(False, "--allow-pickle",
+                                              help="Fully unpickle the file (can execute code; trusted files only)")):
     """Print a checkpoint's metadata (step, topology, sizes) without restoring it."""
     import torch
 
-    from flextrain.checkpoint import validate_checkpoint
+    from flextrain.checkpoint import (
+        CheckpointCorruptedError,
+        LocalStorage,
+        UntrustedCheckpointError,
+        validate_checkpoint,
+    )
 
-    state = torch.load(path, map_location="cpu", weights_only=False)
+    storage = LocalStorage(allow_pickle=allow_pickle)
+    try:
+        verified = storage.read_digest(path) is not None
+        state = storage.load(path)  # checks the SHA-256 digest when one was recorded
+    except CheckpointCorruptedError as e:
+        typer.secho(f"Corrupted checkpoint: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from None
+    except UntrustedCheckpointError as e:
+        typer.secho(f"{e} (here: --allow-pickle)", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from None
     problems = validate_checkpoint(state)
     if problems:
         typer.secho(f"Not a valid FlexTrain checkpoint: {'; '.join(problems)}", fg=typer.colors.RED, err=True)
@@ -153,6 +170,7 @@ def inspect(path: Path = typer.Argument(..., help="Checkpoint file")):
     trainer = state.get("trainer", {})
     typer.echo(f"checkpoint      : {path} ({path.stat().st_size / 1e6:.1f} MB)")
     typer.echo(f"format / version: {state['format_version']} / flextrain {state.get('flextrain_version', '?')}")
+    typer.echo(f"integrity       : {'sha256 verified' if verified else 'no digest recorded (unverified)'}")
     typer.echo(f"step / epoch    : {state['step']} / {state.get('epoch')}")
     typer.echo(f"world size      : {state.get('world_size')} (global batch {state.get('global_batch')})")
     typer.echo(f"data position   : {trainer.get('sampler')}")

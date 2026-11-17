@@ -1,0 +1,44 @@
+{
+  "environment": {
+    "torch": "2.15.0",
+    "python": "3.11.12",
+    "device": "CPU (8 cores)",
+    "torch_threads": "4",
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "workdir": "/var/folders/9p/cgf22dqx1mbgpbndrzcngt000000gn/T/flextrain-bench-jswbbwnx"
+  },
+  "model_size": "small",
+  "params_millions": 124.439808,
+  "checkpoint": {
+    "checkpoint_mb": 1493.445663,
+    "sync_block_ms": 1829.6757920179516,
+    "async_block_first_ms": 127.97066700295545,
+    "async_block_ms": 108.60475001391023,
+    "persist_mbps": 600.9850015664299,
+    "stall_reduction_pct": 94.06426261484665,
+    "load_warm_mbps": 1941.0658906200017,
+    "resume_s": 0.798839458002476
+  },
+  "end_to_end": {
+    "train_none_s": 11.771825000003446,
+    "train_sync_s": 16.34560958298971,
+    "train_async_s": 15.252191083010985,
+    "sync_overhead_pct": 38.853657635795,
+    "async_overhead_pct": 29.565221051166834,
+    "overhead_reduction_pct": 23.906208964148956,
+    "step_s": 0.3923941666667815
+  },
+  "settings": {
+    "model_size": "small",
+    "device": "auto",
+    "repeats": 5,
+    "steps": 30,
+    "ckpt_every": 10,
+    "batch_size": null,
+    "seq_len": null,
+    "threads": null,
+    "skip_e2e": false,
+    "dir": null,
+    "output": "results/benchmark_macos_arm64.json"
+  }
+}

@@ -53,7 +53,7 @@ def test_launch_dry_run_builds_torchrun_command(tmp_path):
                                  "train.py", "--epochs", "3"])
     assert result.exit_code == 0, result.output
     out = result.output
-    assert "torch.distributed.run" in out and "--nproc-per-node=2" in out and "--max-restarts=4" in out
+    assert "flextrain.elastic.agent" in out and "--nproc-per-node=2" in out and "--max-restarts=4" in out
     assert "train.py --epochs 3" in out and "FLEXTRAIN_CONFIG=" in out and "FLEXTRAIN_OVERRIDES=" in out
 
 
@@ -78,6 +78,31 @@ def test_inspect_checkpoint(make_config):
     result = runner.invoke(app, ["inspect", trainer.checkpoint_manager.latest_checkpoint()])
     assert result.exit_code == 0, result.output
     assert "step / epoch    : 5" in result.output and "world size      : 1" in result.output
+    assert "sha256 verified" in result.output
+
+
+def test_inspect_reports_corruption(make_config):
+    torch.manual_seed(0)
+    trainer = Trainer(TinyModel(), make_config(5), RegressionDataset())
+    trainer.train()
+    path = trainer.checkpoint_manager.latest_checkpoint()
+    with open(path, "r+b") as f:
+        f.seek(-200, 2)
+        byte = f.read(1)
+        f.seek(-200, 2)
+        f.write(bytes([byte[0] ^ 0xFF]))
+    result = runner.invoke(app, ["inspect", path])
+    assert result.exit_code == 1 and "Corrupted checkpoint" in result.output
+
+
+def test_inspect_does_not_unpickle_arbitrary_objects_unless_told_to(tmp_path):
+    import threading
+
+    path = tmp_path / "x.pt"
+    torch.save({"format_version": 1, "step": 3, "model": {}, "hook": threading.Event}, path)
+    refused = runner.invoke(app, ["inspect", str(path)])
+    assert refused.exit_code == 1 and "--allow-pickle" in refused.output
+    assert runner.invoke(app, ["inspect", str(path), "--allow-pickle"]).exit_code == 0
 
 
 def test_inspect_rejects_foreign_file(tmp_path):
