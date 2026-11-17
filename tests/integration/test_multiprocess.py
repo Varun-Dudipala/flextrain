@@ -288,18 +288,26 @@ def test_hung_worker_times_out_and_the_job_recovers(tmp_path):
     assert registry["status"] == "completed" and registry["restart_count"] == 1
 
 
-def test_elastic_resize_resumes_from_exact_global_data_position(baseline, tmp_path):
-    """Run on 2 ranks, fail, resume on 1 rank: same global batch, no sample repeated or skipped."""
+@pytest.mark.parametrize("before,after", [(2, 1), (1, 2)], ids=["shrink-2-to-1", "grow-1-to-2"])
+def test_elastic_resize_resumes_from_exact_global_data_position(baseline, tmp_path, before, after):
+    """Run on ``before`` ranks, fail, resume on ``after`` ranks: the same global batch, no sample
+    repeated or skipped, and weights that match a run that was never resized."""
     config = write_config(tmp_path)
     out_a, out_b = tmp_path / "phase_a", tmp_path / "phase_b"
-    proc_a = run_job(config, tmp_path, out_a, nproc=2, max_restarts=0, FT_CRASH_AT_STEP="7")
+    proc_a = run_job(config, tmp_path, out_a, nproc=before, max_restarts=0,
+                     FT_CRASH_AT_STEP="7", FT_CRASH_RANK=str(before - 1))
     assert proc_a.returncode != 0
-    proc_b = run_job(config, tmp_path, out_b, nproc=1)
+    assert all(r["world_size"] == before for r in read_records(out_a / "samples_rank0.jsonl"))
+    proc_b = run_job(config, tmp_path, out_b, nproc=after)
     assert_ok(proc_b)
 
-    res = results(out_b)[0]
-    assert res["world_size"] == 1 and res["accumulation_steps"] == 2  # global batch preserved at 8
-    assert res["resumed_from"].endswith("checkpoint_step00000005.pt") and res["step"] == 12
+    res = results(out_b)
+    assert sorted(res) == list(range(after))
+    for rank in res:
+        assert res[rank]["world_size"] == after
+        assert res[rank]["accumulation_steps"] == 2 // after  # global batch preserved at 8
+        assert res[rank]["resumed_from"].endswith("checkpoint_step00000005.pt") and res[rank]["step"] == 12
+    assert len({r["digest"] for r in res.values()}) == 1, "ranks ended with different weights"
 
     by_step = step_samples([out_a, out_b])
     perm = expected_permutation(epoch=0)
@@ -308,5 +316,5 @@ def test_elastic_resize_resumes_from_exact_global_data_position(baseline, tmp_pa
     consumed = [i for step in range(1, 13) for i in by_step[step]]
     assert sorted(consumed) == list(range(DATASET_SIZE))  # every sample exactly once in the epoch
 
-    for a, b in zip(_params(res), _params(baseline[0]), strict=True):
+    for a, b in zip(_params(res[0]), _params(baseline[0]), strict=True):
         torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-4)
