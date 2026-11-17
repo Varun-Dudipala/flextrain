@@ -13,6 +13,11 @@ handles any stop request: it passes the signal to the workers, which stop togeth
 step boundary and write a checkpoint. The variable is set only by ``flextrain launch``; run
 by hand (or from a command printed by ``launch --dry-run``) the agent does not watch anything,
 so it is safe under ``nohup`` and after its shell exits.
+
+A launcher can also die before the watch exists: this process needs a few seconds to start
+(importing torch), and a launcher killed in that time is no longer the parent when the check
+runs. The variable then names a process that is not the parent, and the agent exits without
+starting the job rather than run it with nothing watching.
 """
 
 from __future__ import annotations
@@ -36,10 +41,18 @@ def _watch_launcher(launcher_pid: int) -> None:
 
 
 def watch_launcher_if_asked() -> bool:
-    """Start the watch if this process was started by the launcher named in the environment."""
+    """Start the watch if the environment names the launcher that started this process.
+
+    Returns False when it names none (run by hand). Exits when it names a process that is not
+    the parent: only ``flextrain launch`` sets the variable, for its own child, so that launcher
+    died while this process was starting.
+    """
     value = os.environ.get(LAUNCHER_PID_ENV_VAR, "")
-    if not value.isdigit() or int(value) != os.getppid():
+    if not value.isdigit():
         return False
+    if int(value) != os.getppid():
+        sys.exit(f"flextrain launch (pid {value}) is gone; not starting the job. "
+                 f"(To run the agent by hand, unset ${LAUNCHER_PID_ENV_VAR}.)")
     threading.Thread(target=_watch_launcher, args=(int(value),), daemon=True,
                      name="flextrain-launcher-watch").start()
     return True
