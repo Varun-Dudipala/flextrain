@@ -124,6 +124,35 @@ def restore_rng_state(state: Dict[str, Any]) -> None:
         torch.cuda.set_rng_state(state["cuda"])
 
 
+def nonfinite_values(state: Dict[str, Any]) -> Optional[str]:
+    """Where a checkpoint's model or optimizer state holds NaN or infinity, or ``None`` if nowhere.
+
+    A run can write checkpoints after its weights have blown up and before anything notices;
+    such a checkpoint loads without error and is useless to go back to.
+    """
+    def walk(value: Any, where: str) -> Optional[str]:
+        if isinstance(value, torch.Tensor):
+            if (value.is_floating_point() or value.is_complex()) and not bool(torch.isfinite(value).all()):
+                return where
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                found = walk(item, f"{where}.{key}")
+                if found:
+                    return found
+        elif isinstance(value, (list, tuple)):
+            for i, item in enumerate(value):
+                found = walk(item, f"{where}[{i}]")
+                if found:
+                    return found
+        return None
+
+    for part in ("model", "optimizer"):
+        found = walk(state.get(part), part)
+        if found:
+            return f"non-finite values in {found}"
+    return None
+
+
 def validate_checkpoint(state: Any) -> List[str]:
     """Return a list of problems (empty if ``state`` looks like a usable checkpoint)."""
     if not isinstance(state, dict):

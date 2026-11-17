@@ -203,41 +203,75 @@ class TestLauncherStopSignals:
 
 
 class TestAgentWatchesItsLauncher:
-    def test_watch_only_starts_for_the_parent_named_in_the_environment(self, monkeypatch):
-        import os
-
+    def test_no_watch_when_the_environment_names_no_launcher(self, monkeypatch):
         from flextrain.elastic.agent import watch_launcher_if_asked
 
         monkeypatch.delenv("FLEXTRAIN_LAUNCHER_PID", raising=False)
         assert watch_launcher_if_asked() is False  # run by hand / from a --dry-run command line
-        monkeypatch.setenv("FLEXTRAIN_LAUNCHER_PID", str(os.getpid()))
-        assert watch_launcher_if_asked() is False  # names some process that is not our parent
 
-    def test_agent_stops_when_its_launcher_dies(self, tmp_path):
-        """A middle process plays the launcher: it starts a watching child and is then killed.
-        The child must notice and deliver SIGTERM to itself."""
+    # A middle process plays the launcher: it names itself in the environment and starts the child
+    # in its own session, as `flextrain launch` does. The child reports what it did in a file.
+    MIDDLE = ("import os, subprocess, sys, time\n"
+              "env = dict(os.environ, FLEXTRAIN_LAUNCHER_PID=str(os.getpid()))\n"
+              "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]], env=env,\n"
+              "                 start_new_session=True)\n"
+              "time.sleep(float(sys.argv[3]))\n")
+
+    def run_child(self, child, report, launcher_lifetime):
         import subprocess
+
+        return subprocess.Popen([sys.executable, "-c", self.MIDDLE, child, str(report), str(launcher_lifetime)])
+
+    def wait_for(self, report, text, seconds=60):
         import time
 
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if report.exists() and text in report.read_text():
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_agent_stops_when_its_launcher_dies(self, tmp_path):
+        """The launcher is killed once the child is watching. The child must notice and deliver
+        SIGTERM to itself."""
         child = ("import os, signal, sys, time\n"
                  "from flextrain.elastic.agent import watch_launcher_if_asked\n"
-                 "signal.signal(signal.SIGTERM, lambda s, f: (open(sys.argv[1], 'w').write('stopped'), sys.exit(0)))\n"
+                 "def stopped(s, f):\n"
+                 "    open(sys.argv[1], 'a').write('stopped')\n"
+                 "    sys.exit(0)\n"
+                 "signal.signal(signal.SIGTERM, stopped)\n"
                  "assert watch_launcher_if_asked()\n"
-                 "time.sleep(60)\n")
-        middle = ("import os, subprocess, sys, time\n"
-                  "env = dict(os.environ, FLEXTRAIN_LAUNCHER_PID=str(os.getpid()))\n"
-                  "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]], env=env,\n"
-                  "                 start_new_session=True)\n"
-                  "time.sleep(60)\n")
-        marker = tmp_path / "stopped"
-        launcher = subprocess.Popen([sys.executable, "-c", middle, child, str(marker)])
-        time.sleep(3)  # let the child start watching
-        launcher.kill()
-        launcher.wait()
-        deadline = time.time() + 15
-        while time.time() < deadline and not marker.exists():
-            time.sleep(0.1)
-        assert marker.exists(), "the agent stand-in did not notice that its launcher was gone"
+                 "open(sys.argv[1], 'a').write('watching ')\n"
+                 "time.sleep(120)\n")
+        report = tmp_path / "report"
+        launcher = self.run_child(child, report, launcher_lifetime=120)
+        try:
+            # However long the child takes to import torch: kill the launcher only once it watches.
+            assert self.wait_for(report, "watching"), "the agent stand-in never started watching"
+        finally:
+            launcher.kill()
+            launcher.wait()
+        assert self.wait_for(report, "stopped", seconds=15), "the agent stand-in did not notice its launcher was gone"
+
+    def test_agent_does_not_start_the_job_if_its_launcher_died_while_it_was_starting(self, tmp_path):
+        """The launcher is gone before the child gets to the check (here: it exits at once, and the
+        child waits for that). Starting to watch a parent that is already gone would watch nothing."""
+        child = ("import os, sys, time\n"
+                 "while os.getppid() == int(os.environ['FLEXTRAIN_LAUNCHER_PID']):\n"
+                 "    time.sleep(0.05)\n"
+                 "from flextrain.elastic.agent import watch_launcher_if_asked\n"
+                 "try:\n"
+                 "    watching = watch_launcher_if_asked()\n"
+                 "except SystemExit as e:\n"
+                 "    open(sys.argv[1], 'a').write(f'refused: {e}')\n"
+                 "else:\n"
+                 "    open(sys.argv[1], 'a').write(f'carried on, watching={watching}')\n")
+        report = tmp_path / "report"
+        self.run_child(child, report, launcher_lifetime=0).wait()
+        assert self.wait_for(report, ""), "the agent stand-in never reported"
+        assert self.wait_for(report, "refused: flextrain launch"), report.read_text()
+        assert "is gone; not starting the job" in report.read_text()
 
 
 class TestRestartNamespace:

@@ -7,6 +7,7 @@ from .snapshot import SnapshotBuffers, snapshot_to_cpu
 from .state import (
     capture_rng_state,
     capture_state,
+    nonfinite_values,
     restore_rng_state,
     restore_state,
     validate_checkpoint,
@@ -38,6 +39,7 @@ __all__ = [
     "restore_state",
     "capture_rng_state",
     "restore_rng_state",
+    "nonfinite_values",
     "validate_checkpoint",
     "StorageBackend",
     "UntrustedCheckpointError",

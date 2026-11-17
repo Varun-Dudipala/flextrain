@@ -19,8 +19,9 @@ class NonFiniteGuard:
     after gradient all-reduce (DDP) or the sharded norm reduction (FSDP), so all ranks
     skip the same steps without an extra collective.
 
-    Raising after ``max_consecutive`` skips lets the elastic agent restart the job from
-    the last good checkpoint instead of training on garbage for hours.
+    Raising after ``max_consecutive`` skips stops the run from training on garbage for hours.
+    The trainer answers the exception by rolling back to an earlier checkpoint (see
+    ``Trainer._rollback``); with rollback disabled or exhausted it ends the run.
     """
 
     def __init__(self, max_consecutive: int = 5, enabled: bool = True):
@@ -42,6 +43,10 @@ class NonFiniteGuard:
                 f"{self.consecutive} consecutive non-finite steps (limit {self.max_consecutive}) at step {step}"
             )
         return True
+
+    def reset_streak(self) -> None:
+        """Forget the current run of skipped steps (the trainer has rolled back past it)."""
+        self.consecutive = 0
 
     def state_dict(self) -> dict:
         return {"consecutive": self.consecutive, "total_skipped": self.total_skipped}

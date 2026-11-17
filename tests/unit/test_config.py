@@ -128,6 +128,12 @@ class TestValidation:
         with pytest.raises(ConfigError, match="stop_grace_seconds"):
             FaultToleranceConfig(stop_grace_seconds=0)
 
+    def test_rollback_limit(self):
+        assert FaultToleranceConfig().max_rollbacks == 2
+        assert FaultToleranceConfig(max_rollbacks=0).max_rollbacks == 0  # rollback off
+        with pytest.raises(ConfigError, match="max_rollbacks"):
+            FaultToleranceConfig(max_rollbacks=-1)
+
     def test_run_name_cannot_escape_output_dir(self):
         with pytest.raises(ConfigError):
             Config.from_dict({"main": {"run_name": "../evil"}})

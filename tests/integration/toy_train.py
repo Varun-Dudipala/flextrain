@@ -8,6 +8,8 @@ Behaviour is controlled by environment variables so the tests can inject failure
   FT_CRASH_RANK        ... (default 1) - only in the first incarnation (restart count 0)
   FT_STEP_SLEEP        seconds to sleep per step (gives the tests time to send signals)
   FT_FAIL_SAVE_AT_STEP rank 0's storage refuses to write checkpoints from this step on
+  FT_BAD_SAMPLES       comma-separated sample indices; in epoch 0 a micro-batch containing one has a
+                       NaN loss (epoch 0 only: the samples come round again in every later epoch)
 """
 
 from __future__ import annotations
@@ -65,6 +67,7 @@ class InstrumentedTrainer(Trainer):
         self.crash_at = int(os.environ.get("FT_CRASH_AT_STEP", "0"))
         self.crash_rank = int(os.environ.get("FT_CRASH_RANK", "1"))
         self.step_sleep = float(os.environ.get("FT_STEP_SLEEP", "0"))
+        self.bad_samples = {int(i) for i in os.environ.get("FT_BAD_SAMPLES", "").split(",") if i}
         fail_save_at = int(os.environ.get("FT_FAIL_SAVE_AT_STEP", "0"))
         if fail_save_at and self.is_main_process:
             storage = self.checkpoint_manager.storage
@@ -84,7 +87,9 @@ class InstrumentedTrainer(Trainer):
                   "idx": batch["idx"].tolist()}
         self.sample_log.write(json.dumps(record) + "\n")
         self.sample_log.flush()
-        return super().compute_loss(batch)
+        loss = super().compute_loss(batch)
+        bad = self.epoch == 0 and self.bad_samples.intersection(record["idx"])
+        return loss * float("nan") if bad else loss
 
     def _after_step(self):
         stop = super()._after_step()
@@ -106,6 +111,7 @@ def main() -> int:
         "status": result.status, "step": result.global_step, "world_size": trainer.world_size,
         "accumulation_steps": trainer.accumulation_steps, "restart": trainer.restart,
         "resumed_from": trainer.resumed_from, "digest": params_digest(trainer.model),
+        "rollbacks": trainer.rollbacks,
         "params": [p.detach().cpu().flatten().tolist() for p in trainer.model.parameters()],
     }))
     trainer.close()

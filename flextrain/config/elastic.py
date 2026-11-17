@@ -74,10 +74,17 @@ class FaultToleranceConfig(BaseConfig):
     stop_grace_seconds: Optional[float] = 15.0
 
     # Divergence guard: an optimizer step with a non-finite gradient norm is skipped.
-    # More than ``max_consecutive_nonfinite`` skipped steps in a row raises, which lets
-    # the elastic agent restart the job from the last good checkpoint.
+    # More than ``max_consecutive_nonfinite`` skipped steps in a row means the run has
+    # diverged.
     skip_nonfinite_steps: bool = True
     max_consecutive_nonfinite: int = 5
+    # Divergence rollback: a diverged run reloads, without restarting, the newest checkpoint
+    # that was written before the first non-finite step and holds only finite values, skips
+    # the data between that checkpoint and the failure, and carries on. (Replaying the same
+    # data would reproduce the same divergence: resume is exact.) This many rollbacks in a
+    # row, without training getting past the step where it last diverged, end the run;
+    # 0 disables rollback, and divergence then ends the run at once.
+    max_rollbacks: int = 2
 
     @classmethod
     def section_name(cls) -> str:
@@ -94,3 +101,4 @@ class FaultToleranceConfig(BaseConfig):
         if self.stop_grace_seconds is not None:
             _require(self.stop_grace_seconds > 0, "fault_tolerance.stop_grace_seconds must be positive (or null)")
         _require(self.max_consecutive_nonfinite >= 1, "fault_tolerance.max_consecutive_nonfinite must be >= 1")
+        _require(self.max_rollbacks >= 0, "fault_tolerance.max_rollbacks must be >= 0")
