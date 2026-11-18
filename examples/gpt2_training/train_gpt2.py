@@ -78,6 +78,10 @@ def main() -> int:
     size = model_cfg.pop("size", "tiny")
     seq_len = int(config.data.get("seq_len", 128))
     model_cfg.setdefault("max_position_embeddings", max(seq_len, 256))
+    # The Trainer seeds everything it does, but the model is built before the Trainer exists.
+    # Without this the initial weights - and so the whole run - would differ from one launch
+    # to the next whatever main.seed says. (Ranks need not agree here: DDP takes rank 0's.)
+    torch.manual_seed(config.main.seed)
     model = create_gpt2_model(size, **model_cfg)
 
     dataset = ByteTextDataset(resolve_files(config.data.get("paths", [])), seq_len)
