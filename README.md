@@ -21,7 +21,7 @@ Checkpoint written: .../checkpoint_step00000020.pt  <- background thread, fsync'
 
 | Guarantee | Mechanism | Proven by |
 |---|---|---|
-| **Exact resume** – crash at step *k*, resume, and the final weights are *bitwise identical* to an uninterrupted run (shown on CPU; on a GPU this additionally needs deterministic algorithms, which FlexTrain does not switch on and no test covers) | checkpoints hold model, optimizer, LR schedule, grad scaler, every rank's RNG state and the sampler's global data position; data augmentation is seeded per sample, so it replays identically even from DataLoader worker processes | `tests/unit/test_trainer.py::TestExactResume`, `tests/integration/…::test_worker_crash_is_recovered_by_elastic_restart`, [randomized kills](#randomized-fault-injection) |
+| **Exact resume** – crash at step *k*, resume, and the final weights are *bitwise identical* to an uninterrupted run (shown on CPU; on a GPU this additionally needs deterministic algorithms, which FlexTrain does not switch on and no test covers) | checkpoints hold model, optimizer, LR schedule, grad scaler, every rank's RNG state and the sampler's global data position; data augmentation is seeded per sample, so it replays identically even from DataLoader worker processes | `tests/unit/test_trainer.py::TestExactResume`, `tests/integration/…::test_worker_crash_is_recovered_by_elastic_restart`, [randomized kills](#randomized-fault-injection), [a 1.5-hour GPT-2 run killed 13 times](#a-long-run-under-random-kills) |
 | **Non-blocking checkpoints** – the step loop pauses only for a device→host snapshot | snapshot into reusable (pinned) host buffers; serialize + write + `fsync` on a single FIFO background thread with bounded in-flight saves | `tests/unit/test_async_writer.py`, [benchmarks](#benchmarks) |
 | **Failure recovery** – a crashed rank restarts the job from the newest *valid* checkpoint | torchelastic restarts the worker group → auto-resume (checkpoints that are unreadable or fail their SHA-256 digest are skipped); hangs become errors via the collective timeout | `test_worker_crash_is_recovered_by_elastic_restart`, `test_hung_worker_times_out_and_the_job_recovers`, `test_corrupted_latest_falls_back_to_previous`, `test_bit_rot_in_latest_falls_back_to_previous` |
 | **Elastic resizing** – resume on fewer or more ranks (tested 2 → 1 and 1 → 2) without repeating or skipping data, and with the same global batch when `global_batch_size` divides evenly. Weights then match an unresized run to 1e-5 (not bitwise: per-rank random streams are re-seeded on a resize; tested without dropout) | data position is tracked as a *global* sample offset and re-sharded for the new world size; gradient accumulation is re-derived from `global_batch_size` | `test_elastic_resize_resumes_from_exact_global_data_position`, `tests/unit/test_sampler.py` |
@@ -36,7 +36,7 @@ training with gradient accumulation (`test_two_ranks_match_single_process_with_a
 **What this evidence covers, and what it does not.** Every test and measurement in this README ran
 on CPU with the `gloo` backend, with at most two ranks on one machine. Nothing here has been run
 on a GPU, with NCCL, with FSDP, or across more than one node, and the largest model trained end to
-end is GPT-2 small for a few dozen benchmark steps. The mechanisms are written for those
+end is GPT-2 small for 700 steps (the [long run](#a-long-run-under-random-kills)). The mechanisms are written for those
 settings; the proof is not there yet. See [Limitations](#limitations-and-next-steps).
 
 ## Quick start
@@ -348,9 +348,40 @@ flextrain/
 └── cli/              flextrain launch | validate | init-config | status | inspect | serve
 examples/gpt2_training/   GPT-2 (SDPA attention) + runnable training script
 scripts/benchmark.py      checkpoint + end-to-end overhead benchmark
+scripts/soak.py           long run under random kills, compared bit for bit with an unkilled run
 tests/{unit,integration,examples,gpu}/   integration/chaos.py is the randomized fault-injection harness
 results/                  raw data behind the numbers quoted in this README
 ```
+
+### A long run under random kills
+
+The campaign above uses a toy model and jobs that last seconds. `scripts/soak.py` asks the same
+question of a real model over a longer time. It starts the GPT-2 example twice through
+`flextrain launch`, on 2 ranks each, from one frozen copy of the code: a **reference** job that
+is left alone and saves once at the end, and a job that checkpoints every 25 steps and has a
+randomly chosen rank killed with `SIGKILL` at random moments (exponential gaps, 8 minutes on
+average, never less than 2 minutes apart). At the end it compares the two final checkpoints
+bit for bit: every model and optimizer tensor, the LR schedule, the loss-scaler state, the data
+position and every rank's random-number state. It passes only if they are identical, both jobs
+exit 0 at the final step, the reference never restarted, and the killed job restarted exactly
+once per kill.
+
+| Run | Result |
+|---|---|
+| GPT-2 small (85M parameters, 1 GB checkpoints), 700 steps, 2 ranks; 13 kills over 1.47 hours (10 on rank 0, 3 on rank 1) | **final checkpoint bitwise identical to the unkilled run** (593 tensors), 13 restarts, 0 rollbacks |
+
+Measured once, on an Apple M-series laptop (macOS, torch 2.15, CPU, gloo, one thread per rank);
+raw data, including every kill, in [`results/soak_macos_arm64.json`](results/soak_macos_arm64.json).
+Reproduce with `make soak`. What it does not show: it is one run of an hour and a half, not days;
+only worker processes were killed, never the launcher or the machine; kills are at least 2
+minutes apart, so none lands while the job is still restarting (the campaign above covers that);
+and, as everywhere in this README, there is no GPU and no second node. The two jobs shared the
+laptop's cores, so the 1.47 h against 1.28 h for the reference is not a clean measure of what the
+kills cost.
+
+A five-minute pilot of this test failed, and the fault was in the example rather than in
+recovery: `train_gpt2.py` built its model before any seed was set, so two launches with the same
+`main.seed` started from different weights. The example now seeds before it builds the model.
 
 ## Limitations and next steps
 

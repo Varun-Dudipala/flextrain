@@ -1,4 +1,4 @@
-.PHONY: install lint test test-unit test-integration chaos bench demo
+.PHONY: install lint test test-unit test-integration chaos soak bench demo
 
 install:  ## editable install with dev tools (CPU wheels work fine)
 	pip install -e ".[dev]"
@@ -17,6 +17,9 @@ test-integration:
 
 chaos:  ## randomized fault injection: SIGKILL random ranks, require a bitwise-identical result
 	python -m tests.integration.chaos --trials 50 --max-kills 3 --output chaos_results.json
+
+soak:  ## GPT-2 small on 2 ranks, killed at random for 700 steps; must end bitwise identical to an unkilled run (takes hours)
+	python scripts/soak.py --steps 700 --ckpt-every 25 --mean-kill-seconds 480 --min-kill-gap 120 --output soak_results.json
 
 bench:  ## checkpoint + training-overhead benchmark (GPU if available)
 	python scripts/benchmark.py --output benchmark_results.json

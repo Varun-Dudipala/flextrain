@@ -1,0 +1,145 @@
+{
+  "passed": true,
+  "environment": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "python": "3.11.12",
+    "torch": "2.15.0",
+    "cpu_count": 8,
+    "commit": "e77e9d8",
+    "uncommitted_changes_in_code": true,
+    "code_sha256": "760e8555a982bdf0ce1a30f88af1abdcbcbb347b2cd2f0b4f5f0b66b8fec8845"
+  },
+  "settings": {
+    "steps": 700,
+    "ckpt_every": 25,
+    "mean_kill_seconds": 480.0,
+    "min_kill_gap": 120.0,
+    "model_size": "small",
+    "batch_size": 8,
+    "seq_len": 128,
+    "eval_every": 100,
+    "threads": 1,
+    "max_restarts": 500,
+    "seed": 42
+  },
+  "jobs": {
+    "reference": {
+      "exit_code": 0,
+      "status": "completed",
+      "final_step": 700,
+      "restarts": 0,
+      "hours": 1.277
+    },
+    "killed": {
+      "exit_code": 0,
+      "status": "completed",
+      "final_step": 700,
+      "restarts": 13,
+      "hours": 1.47
+    }
+  },
+  "kills_delivered": 13,
+  "kills": [
+    {
+      "minutes_in": 8.17,
+      "rank": 0,
+      "step_reported": 30,
+      "last_checkpoint_step": null,
+      "restarts_before": 0
+    },
+    {
+      "minutes_in": 19.0,
+      "rank": 0,
+      "step_reported": 85,
+      "last_checkpoint_step": 50,
+      "restarts_before": 1
+    },
+    {
+      "minutes_in": 21.03,
+      "rank": 0,
+      "step_reported": 90,
+      "last_checkpoint_step": 50,
+      "restarts_before": 2
+    },
+    {
+      "minutes_in": 30.08,
+      "rank": 0,
+      "step_reported": 155,
+      "last_checkpoint_step": 125,
+      "restarts_before": 3
+    },
+    {
+      "minutes_in": 37.24,
+      "rank": 0,
+      "step_reported": 205,
+      "last_checkpoint_step": 175,
+      "restarts_before": 4
+    },
+    {
+      "minutes_in": 39.24,
+      "rank": 0,
+      "step_reported": 210,
+      "last_checkpoint_step": 175,
+      "restarts_before": 5
+    },
+    {
+      "minutes_in": 41.36,
+      "rank": 0,
+      "step_reported": 215,
+      "last_checkpoint_step": 175,
+      "restarts_before": 6
+    },
+    {
+      "minutes_in": 47.96,
+      "rank": 1,
+      "step_reported": 250,
+      "last_checkpoint_step": 225,
+      "restarts_before": 7
+    },
+    {
+      "minutes_in": 49.97,
+      "rank": 1,
+      "step_reported": 255,
+      "last_checkpoint_step": 225,
+      "restarts_before": 8
+    },
+    {
+      "minutes_in": 63.24,
+      "rank": 0,
+      "step_reported": 335,
+      "last_checkpoint_step": 300,
+      "restarts_before": 9
+    },
+    {
+      "minutes_in": 74.62,
+      "rank": 0,
+      "step_reported": 420,
+      "last_checkpoint_step": 375,
+      "restarts_before": 10
+    },
+    {
+      "minutes_in": 84.2,
+      "rank": 1,
+      "step_reported": 625,
+      "last_checkpoint_step": 600,
+      "restarts_before": 11
+    },
+    {
+      "minutes_in": 86.82,
+      "rank": 0,
+      "step_reported": 685,
+      "last_checkpoint_step": 650,
+      "restarts_before": 12
+    }
+  ],
+  "comparison": {
+    "identical": true,
+    "differences": [],
+    "tensors_compared": 593,
+    "model_sha256": {
+      "reference": "1e0ccd251d49d24d38b8fe90a7479b1a90251fd20d938dbd3a50d94517cbde95",
+      "killed": "1e0ccd251d49d24d38b8fe90a7479b1a90251fd20d938dbd3a50d94517cbde95"
+    },
+    "killed_rollbacks": 0
+  }
+}
